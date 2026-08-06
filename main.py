@@ -23,7 +23,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 # --------------------------------------------------------------------------
 # 👇 केवल इन 2 लाइनों को बदलना है:
 SOURCE_CHAT = "@sxhckfufig"         # जहाँ से मैसेज उठाना है
-TARGET_CHAT = "@ApneTargetChannel"  # 👈 यहाँ अपने असली चैनल का Username या ID डालें
+TARGET_CHAT = "@chatgpt"  # 👈 यहाँ अपने असली चैनल का Username या ID डालें
 # --------------------------------------------------------------------------
 
 if not API_ID or not API_HASH or not SESSION_STRING:
