@@ -23,7 +23,7 @@ FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com"
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://my-bot-qkto.onrender.com")
 
 if not API_ID or not API_HASH or not SESSION_STRING:
-    raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING missing hain!")
+    raise RuntimeError("API_ID, API_HASH, या SESSION_STRING मिसिंग हैं!")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -34,7 +34,7 @@ async def home():
     return "Stream & Forwarder Bot is Active!"
 
 # -------------------------------------------------------------
-# 3. FIXED MEDIA ROUTE (PDF Download + Stream support)
+# 3. ADVANCED MEDIA ROUTE (Range-based Video Stream + Fast PDF)
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
 async def stream_file(msg_id):
@@ -43,7 +43,6 @@ async def stream_file(msg_id):
         if not message or not message.media:
             return "Media not found", 404
 
-        # 1. File size & Mime Type निकालना
         file_size = 0
         mime_type = "application/octet-stream"
         file_name = f"file_{msg_id}"
@@ -56,7 +55,7 @@ async def stream_file(msg_id):
                 if hasattr(attr, 'file_name') and attr.file_name:
                     file_name = attr.file_name
 
-        # PDF / Documents के लिए: Direct Fast Download (Browser Error Fix)
+        # 📄 PDF / Documents Solution (यह पहले से सही काम कर रहा है)
         if "pdf" in mime_type.lower() or "document" in mime_type.lower():
             file_bytes = await client.download_media(message, file=bytes)
             return Response(
@@ -68,22 +67,44 @@ async def stream_file(msg_id):
                 }
             )
 
-        # Video Streaming के लिए Buffer Delivery
-        async def generate():
+        # 🎥 Video Seeking & Fast Proxy Stream (502 Timeout Fix)
+        range_header = request.headers.get('Range', None)
+        
+        start_bytes = 0
+        end_bytes = file_size - 1 if file_size > 0 else 0
+
+        if range_header:
+            match = re.search(r'bytes=(\d+)-(\d*)', range_header)
+            if match:
+                start_bytes = int(match.group(1))
+                if match.group(2):
+                    end_bytes = int(match.group(2))
+
+        chunk_len = end_bytes - start_bytes + 1
+
+        async def generate_video_chunks():
             try:
-                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 256):
+                # Telethon se specific byte-offset seek karke chunk manga rahe hain
+                async for chunk in client.download_media(
+                    message, 
+                    file=bytes, 
+                    offset=start_bytes, 
+                    chunk_size=1024 * 512
+                ):
                     yield chunk
             except Exception as e:
-                log.error(f"Chunk Error: {e}")
+                log.error(f"Video Chunk Streaming Error: {e}")
 
+        status_code = 206 if range_header else 200
         headers = {
-            "Content-Type": mime_type,
-            "Content-Disposition": f'inline; filename="{file_name}"',
-            "Content-Length": str(file_size) if file_size else "",
-            "Accept-Ranges": "bytes"
+            "Content-Type": "video/mp4",
+            "Content-Disposition": f'inline; filename="{file_name}.mp4"',
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes {start_bytes}-{end_bytes}/{file_size if file_size else '*'}",
+            "Content-Length": str(chunk_len) if file_size > 0 else ""
         }
 
-        return Response(generate(), headers=headers)
+        return Response(generate_video_chunks(), status=status_code, headers=headers)
 
     except Exception as e:
         log.error(f"Stream Exception: {e}")
@@ -226,7 +247,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Stable Media Engine Active!")
+    log.info("✅ Range-Supported Video Proxy Server Ready!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
