@@ -1,6 +1,7 @@
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
+
 process.on('uncaughtException', (err) => {
   console.error('❌ Uncaught Exception:', err);
 });
@@ -14,7 +15,7 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Configuration Environment Variables
+// Environment Variables Configuration
 const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
@@ -29,19 +30,20 @@ if (!apiId || !apiHash) {
   process.exit(1);
 }
 
-// Client definition
+// GramJS Telegram Client Initialization
 const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
 let pendingMedia = {};
 
+// Root Status Check
 app.get("/", (req, res) => {
   res.send("Node.js Fast Streaming & Forwarder Bot is Active!");
 });
 
 // -------------------------------------------------------------
-// STREAMING ROUTE
+// 1. FAST STREAMING & DOWNLOAD ROUTE
 // -------------------------------------------------------------
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -69,6 +71,7 @@ app.get("/stream/:msgId", async (req, res) => {
       }
     }
 
+    // PDF or Document Handling
     if (mimeType.includes("pdf") || mimeType.includes("document")) {
       res.setHeader("Content-Type", mimeType);
       res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
@@ -76,6 +79,7 @@ app.get("/stream/:msgId", async (req, res) => {
       return res.send(buffer);
     }
 
+    // Video Streaming Range Handling
     const range = req.headers.range;
     let start = 0;
     let end = fileSize ? fileSize - 1 : 0;
@@ -107,7 +111,7 @@ app.get("/stream/:msgId", async (req, res) => {
     }
     res.end();
   } catch (err) {
-    console.error("Stream Route Error:", err);
+    console.error("❌ Stream Route Error:", err);
     if (!res.headersSent) {
       res.status(500).send("Streaming Error: " + err.message);
     }
@@ -115,21 +119,12 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// HELPER: CHAPTER CLEANING
-// -------------------------------------------------------------
-function cleanChapterName(rawName) {
-  if (!rawName) return "Uncategorized";
-  let name = rawName.replace(/@/g, "").trim();
-  name = name.replace(/\b(lec|lecture|part|dpp|notes|class)\b.*/gi, "");
-  name = name.replace(/[\d\-_\:()\[\]]+$/g, "").trim();
-  return name || "Uncategorized";
-}
-
-// -------------------------------------------------------------
-// FIREBASE PUSH LOGIC
+// 2. FIREBASE PUSH LOGIC (ACCORDING TO CHATGPT RULES)
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return;
+
+  console.log(`📩 ChatGPT Response Received: "${replyText}"`);
 
   const replyClean = replyText.trim().toLowerCase();
   const ignoreList = ["सोच...", "thinking...", "please wait...", "generating..."];
@@ -139,37 +134,34 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     return;
   }
 
-  let contentType = "video";
-  if (replyClean.includes("@notes")) contentType = "@notes";
-  else if (replyClean.includes("@dpp")) contentType = "@dpp";
-  else if (replyClean.includes("@other")) contentType = "@other";
+  // Content Type Check (@dpp, @notes, or @other)
+  let contentType = "@other";
+  if (replyClean.includes("@dpp")) contentType = "@dpp";
+  else if (replyClean.includes("@notes")) contentType = "@notes";
 
-  const lecMatch = replyText.match(/(@Lec\s*\d+|@L\d+|Lec\s*\d+)/i);
-  const lecTag = lecMatch ? lecMatch[1] : "";
+  // Lecture Tag Extraction (@Lec XX)
+  const lecMatch = replyText.match(/@Lec\s*\d+/i);
+  const lecTag = lecMatch ? lecMatch[0] : "";
 
-  const tags = replyText.match(/@[^\s@]+(?:\s+[^\s@]+)*/g) || [];
-  let subjectName = "Biology";
-  let rawChapterName = "";
-
+  // Extract all tags including Unicode/Hindi
+  const rawTags = replyText.match(/@[^\s@]+/g) || [];
+  
+  const systemTags = ["@dpp", "@notes", "@other"];
   const validTags = [];
-  for (const tag of tags) {
-    const tClean = tag.trim();
-    const tLower = tClean.toLowerCase();
-    if (!["@notes", "@dpp", "@other"].includes(tLower) && !tLower.startsWith("@lec")) {
-      validTags.push(tClean);
+
+  for (const tag of rawTags) {
+    const tLower = tag.toLowerCase();
+    if (!systemTags.includes(tLower) && !tLower.startsWith("@lec")) {
+      validTags.push(tag.replace("@", "").trim());
     }
   }
 
-  if (validTags.length >= 2) {
-    subjectName = validTags[0].replace(/@/g, "").trim();
-    rawChapterName = validTags[1];
-  } else if (validTags.length === 1) {
-    rawChapterName = validTags[0];
-  }
+  let subjectName = validTags[0] || "General";
+  let chapterName = validTags[1] || "General_Lectures";
 
-  const chapterName = cleanChapterName(rawChapterName);
-  const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "");
-  const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "");
+  // Firebase Keys Cleanup (Firebase disallows ., $, #, [, ], /)
+  const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
+  const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
 
   const dataPayload = {
     content_type: contentType,
@@ -187,21 +179,22 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   }
 
   const firebaseUrl = `${FIREBASE_BASE_URL}/${subjectKey}/${chapterKey}.json`;
+  console.log(`🚀 Firebase Push Target: ${subjectKey} ➔ ${chapterKey}`);
 
   try {
     const res = await axios.post(firebaseUrl, dataPayload);
-    if (res.status === 200) {
-      console.log(`🔥 Firebase Push Success: ${subjectKey} ➔ ${chapterKey}`);
+    if (res.status === 200 || res.status === 201) {
+      console.log(`🔥 SUCCESS: Firebase में डेटा सेव हुआ! Path: ${subjectKey} ➔ ${chapterKey}`);
     } else {
-      console.error(`❌ Firebase Error: ${res.status}`);
+      console.error(`❌ Firebase Error Status: ${res.status}`);
     }
   } catch (err) {
-    console.error(`❌ Firebase Exception:`, err.message);
+    console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
   }
 }
 
 // -------------------------------------------------------------
-// MAIN RUNNER & TELEGRAM EVENT LISTENER
+// 3. MAIN RUNNER & TELEGRAM EVENT LISTENER
 // -------------------------------------------------------------
 async function startServer() {
   await client.connect();
@@ -215,7 +208,7 @@ async function startServer() {
       const chat = await message.getChat();
       if (!chat) return;
 
-      // 1. Channel @sxhckfufig check
+      // 1. Check if message is from @sxhckfufig
       const isSourceChat = 
         (chat.username && chat.username.toLowerCase() === "sxhckfufig") ||
         (chat.title && chat.title.toLowerCase().includes("sxhckfufig"));
@@ -226,7 +219,7 @@ async function startServer() {
         let streamLink = "";
         if (message.media) {
           streamLink = `${RENDER_URL}/stream/${message.id}`;
-          console.log(`🔗 Stream Link: ${streamLink}`);
+          console.log(`🔗 Generated Stream Link: ${streamLink}`);
         }
 
         pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
@@ -238,11 +231,11 @@ async function startServer() {
         console.log("➡️ ChatGPT bot ko query bheji!");
       }
 
-      // 2. Reply from @chatgpt check
+      // 2. Check if reply is from @chatgpt
       const isChatGPT = chat.username && chat.username.toLowerCase() === "chatgpt";
       
       if (isChatGPT) {
-        console.log(`[+] AI Reply Aaya: ${message.text}`);
+        console.log(`[+] ChatGPT Response Received: ${message.text}`);
         const mediaInfo = pendingMedia["latest"] || {};
         await processReplyAndPushToFirebase(message.text, mediaInfo);
       }
