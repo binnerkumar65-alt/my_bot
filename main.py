@@ -6,7 +6,7 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # -------------------------------------------------------------
-# 1. FLASK SERVER (Render Uptime के लिए)
+# 1. FLASK SERVER (Render Uptime Keep-Alive)
 # -------------------------------------------------------------
 app = Flask(__name__)
 
@@ -15,46 +15,52 @@ def home():
     return "Bot is Alive and Running!"
 
 def run_flask():
-    # Render स्वचालित रूप से PORT चुनता है (default 10000)
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# Background में Flask सर्वर स्टार्ट करें
+# Background में Flask चलाएं
 Thread(target=run_flask, daemon=True).start()
 
 # -------------------------------------------------------------
-# 2. CONFIGURATION (Environment Variables से उठाएगा)
+# 2. CONFIGURATION
 # -------------------------------------------------------------
-# आप चाहें तो Environment Variables यूज़ करें या डायरेक्ट अपनी डिटेल्स डालें
-API_ID = int(os.environ.get("30414263", 1234567))        # अपना API_ID लिखें
-API_HASH = os.environ.get("7ac29590d4ad54e141856dfa4cc04dac", "YOUR_API_HASH") # अपना API_HASH लिखें
-SESSION_STRING = os.environ.get("SESSION_STRING")      # Render में डाला गया Session String
+API_ID = int(os.environ.get("API_ID", 30414263))
+API_HASH = os.environ.get("API_HASH", "7ac29590d4ad54e141856dfa4cc04dac")
+SESSION_STRING = os.environ.get("1BVtsOLUBu7NW664h3NBQatAj2edrdpG5Gi8MuFIGoCTBtzNu1HQBuziC3HrOF8YRuo1kt5yD91tVGKETYuALE_gS02KfMNN4R5Mn3xmYvOAH1Muc3S0bsYcYueXEa35-DIKHfM8xQDTXwODRs5PdeKdKwhtH_BhvY0um1lo4_mWeUU8Ew9vGqLJCEvQZtPrxIkLF9RP864uFY8a4dZickEoxXbO9GE-lffbOiv7BXJVYQCWsVloHd__Dw1i5A1Z-qiyOuNgqDKJrFvsAMzWKwLcdVIwWeJrtuAUsnGKmZYwMth4YOEhEhriInlX9x4UJ8_cAPDYH_DeMFtOTj71fJWYZZJE-cbQ=")
 
-# -------------------------------------------------------------
-# 3. TELETHON CLIENT INITIALIZATION
-# -------------------------------------------------------------
+# यहाँ अपने सोर्स और टारगेट चैनल के यूज़रनेम / ID डालें
+SOURCE_CHAT = "@sxhckfufig"      # जहाँ से मैसेज पढ़ना है
+TARGET_CHAT = "@your_target_chat" # जहाँ मैसेज भेजना है (बदल लें)
+
 if not SESSION_STRING:
-    print("❌ ERROR: SESSION_STRING नहीं मिला! Render के Environment Variables में SESSION_STRING सेट करें।")
+    print("❌ SESSION_STRING नहीं मिला!")
     exit(1)
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # -------------------------------------------------------------
-# 4. BOT EVENTS & LOGIC
+# 3. MESSAGE FORWARDING EVENT HANDLER
 # -------------------------------------------------------------
-# उदाहरण: जब कोई मैसेज आए (आप अपना ऑटोमेशन लॉजिक यहाँ बदल सकते हैं)
-@client.on(events.NewMessage)
-async def my_event_handler(event):
-    # Telegram Channel (@sxhckfufig) से मैसेज हैंडलिंग
-    print(f"[+] Message received: {event.text}")
+@client.on(events.NewMessage(chats=SOURCE_CHAT))
+async def forward_handler(event):
+    try:
+        print(f"[+] नया मैसेज मिला: {event.text}")
+        
+        # मैसेज फॉरवर्ड/कॉपी करना
+        if event.text:
+            await client.send_message(TARGET_CHAT, event.text)
+            print("✅ टेक्स्ट मैसेज सफलतापूर्वक फॉरवर्ड हो गया!")
+            
+    except Exception as e:
+        print(f"❌ Forward Error: {e}")
 
 # -------------------------------------------------------------
-# 5. MAIN ASYNC RUNNER
+# 4. MAIN ASYNC RUNNER
 # -------------------------------------------------------------
 async def main():
-    print("[+] Telethon Client स्टार्ट हो रहा है...")
+    print("[+] Telethon Client कनेक्ट हो रहा है...")
     await client.start()
-    print("✅ Bot सफलतापूर्वक लॉगिन हो गया है और लाइव है!")
+    print("✅ Telethon सफलतापूर्वक लॉगिन हो गया है! मैसेज सुनने के लिए तैयार...")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
