@@ -8,7 +8,7 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const events = require("telegram/events");
+const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 
@@ -155,16 +155,15 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
   }
 }
+
 // -------------------------------------------------------------
-// 3. EVENT HANDLERS (EDITED MESSAGE FIXED)
+// 3. EVENT HANDLERS
 // -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
-    // 1. मैसेज टेक्स्ट निकालें (चाहे नया संदेश हो या Edit हुआ हो)
     const message = event.message;
     if (!message) return;
 
-    // GramJS में edited message का टेक्स्ट message.message या message.text में होता है
     const currentText = message.text || message.message || "";
 
     const chat = await message.getChat();
@@ -180,9 +179,6 @@ async function handleIncomingMessage(event) {
       chatTitle.includes("sxhckfufig");
 
     if (isSourceChat) {
-      // चैनल के सिर्फ नए मैसेज पर एक्शन लें
-      if (event.isEdit) return; // अगर चैनल का खुद का मैसेज एडिट हुआ तो इग्नोर करें
-
       console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
       
       let streamLink = "";
@@ -209,12 +205,8 @@ async function handleIncomingMessage(event) {
       CHATGPT_BOT.toLowerCase().includes(senderUsername);
 
     if (isChatGPT) {
-      console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua (IsEdit: ${!!event.isEdit}): "${currentText}"`);
-      
+      console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${currentText}"`);
       const mediaInfo = pendingMedia["latest"] || {};
-      
-      // यह फ़ंक्शन खुद चेक करेगा कि अगर "सोच..." है तो इग्नोर करे, 
-      // और जब एडिट होकर असली जवाब आए तो फ़ायरबेस में भेज दे।
       await processReplyAndPushToFirebase(currentText, mediaInfo);
     }
 
@@ -223,3 +215,33 @@ async function handleIncomingMessage(event) {
   }
 }
 
+// -------------------------------------------------------------
+// 4. SERVER STARTUP
+// -------------------------------------------------------------
+async function startServer() {
+  // 1. Render Port binding
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
+  });
+
+  // 2. Connect Telegram Client
+  try {
+    await client.connect();
+    console.log("✅ Telegram Client Connected!");
+
+    // Safely add event handlers for New Message and Edited Message
+    client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+    
+    try {
+      client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
+    } catch (e) {
+      console.log("⚠️ EditedMessage direct constructor not supported, using fallback handler.");
+    }
+
+    console.log("🤖 Event Handlers Successfully Registered!");
+  } catch (err) {
+    console.error("❌ Telegram Client Connection Error:", err);
+  }
+}
+
+startServer();
