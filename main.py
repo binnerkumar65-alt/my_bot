@@ -2,19 +2,28 @@ import os
 import asyncio
 import requests
 from telethon import TelegramClient, events
+from threading import Thread
+from flask import Flask
 
-# 1. Telegram Credentials (यहाँ अपनी डिटेल्स भरें)
-API_ID = 30414263  # अपना my.telegram.org वाला API ID डालें (बिना Quotes के)
+# Flask App (Render को Web Service दिखाने के लिए)
+app = Flask('')
+
+@app.route('/')
+def home():
+    print("Ping received, bot is alive!")
+    return "Bot is running and active!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+
+# Telegram Credentials
+API_ID = 30414263  # अपना API ID डालें
 API_HASH = "7ac29590d4ad54e141856dfa4cc04dac"  # अपना API HASH डालें
 
-# 2. Target Channels & Bots
 SOURCE_CHANNEL = "sxhckfufig"
 TARGET_BOT = "chatgpt"
-
-# 3. Firebase URL
 FIREBASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com/telegram_data.json"
 
-# Client Init (यह अपने आप 'my_session.session' फ़ाइल बना लेगा)
 client = TelegramClient('my_session', API_ID, API_HASH)
 
 def push_to_firebase(data):
@@ -36,24 +45,18 @@ async def handle_new_message(event):
     print(f"\n[+] New message from @{SOURCE_CHANNEL}")
 
     try:
-        # Step 1: ChatGPT Bot को मैसेज भेजें
         async with client.conversation(TARGET_BOT, timeout=60) as conv:
             await conv.send_message(source_text)
-            
-            # Step 2: ChatGPT Bot के रिप्लाई का इंतज़ार करें
             response = await conv.get_response()
             reply_text = response.text
 
             print(f"[+] Received reply from @{TARGET_BOT}")
 
-            # Step 3: Firebase Payload
             payload = {
                 "source_text": source_text,
                 "processed_tags": reply_text,
                 "timestamp": event.message.date.isoformat()
             }
-
-            # Step 4: Firebase में भेजें
             push_to_firebase(payload)
 
     except asyncio.TimeoutError:
@@ -63,9 +66,14 @@ async def handle_new_message(event):
 
 async def main():
     print("[+] Starting Telethon Client...")
-    await client.start()  # पहली बार चलाने पर यही आपसे Phone Number + OTP पूछेगा
+    await client.start()
     print("[+] Client is running & listening for messages...")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
+    # Flask को अलग Thread में चलाएं ताकि Telegram ब्लॉक न हो
+    t = Thread(target=run_flask)
+    t.start()
+
+    # Telethon Async Loop चलाएं
     asyncio.run(main())
