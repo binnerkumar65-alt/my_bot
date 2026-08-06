@@ -192,7 +192,6 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
   }
 }
-
 // -------------------------------------------------------------
 // 3. MAIN RUNNER & TELEGRAM EVENT LISTENER
 // -------------------------------------------------------------
@@ -208,18 +207,21 @@ async function startServer() {
       const chat = await message.getChat();
       if (!chat) return;
 
-      // 1. Check if message is from @sxhckfufig
+      const chatUsername = (chat.username || "").toLowerCase();
+      const chatTitle = (chat.title || "").toLowerCase();
+
+      // 1. Check Channel Message (@sxhckfufig)
       const isSourceChat = 
-        (chat.username && chat.username.toLowerCase() === "sxhckfufig") ||
-        (chat.title && chat.title.toLowerCase().includes("sxhckfufig"));
+        chatUsername === "sxhckfufig" || 
+        chatTitle.includes("sxhckfufig");
 
       if (isSourceChat) {
-        console.log(`[+] Naya Message Aaya (ID: ${message.id})`);
+        console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
         
         let streamLink = "";
         if (message.media) {
           streamLink = `${RENDER_URL}/stream/${message.id}`;
-          console.log(`🔗 Generated Stream Link: ${streamLink}`);
+          console.log(`🔗 Stream Link Banna: ${streamLink}`);
         }
 
         pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
@@ -228,15 +230,20 @@ async function startServer() {
         const msgText = message.text || "Media File";
         
         await client.sendMessage(chatgptEntity, { message: msgText });
-        console.log("➡️ ChatGPT bot ko query bheji!");
+        console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
+        return;
       }
 
-      // 2. Check if reply is from @chatgpt
-      const isChatGPT = chat.username && chat.username.toLowerCase() === "chatgpt";
-      
+      // 2. Check ChatGPT Reply (@chatgpt ya ChatGPT naam ka koi bot)
+      const isChatGPT = 
+        chatUsername.includes("chatgpt") || 
+        chatTitle.includes("chatgpt");
+
       if (isChatGPT) {
-        console.log(`[+] ChatGPT Response Received: ${message.text}`);
+        console.log(`\n🤖 [STEP 3] ChatGPT Response Aaya: "${message.text}"`);
         const mediaInfo = pendingMedia["latest"] || {};
+        
+        console.log("🚀 [STEP 4] Firebase Push Function Trigger Ho Raha Hai...");
         await processReplyAndPushToFirebase(message.text, mediaInfo);
       }
 
@@ -251,3 +258,4 @@ async function startServer() {
 }
 
 startServer();
+
