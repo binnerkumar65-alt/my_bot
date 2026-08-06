@@ -3,19 +3,15 @@ import re
 import asyncio
 import logging
 import requests
-from flask import Flask
+from flask import Flask, Response, request
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# 1. Flask App
+# 1. Flask App Setup
 app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is Alive and Running!"
 
 # 2. Configuration
 API_ID = int(os.environ.get("API_ID", "0"))
@@ -26,48 +22,66 @@ SOURCE_CHAT = "@sxhckfufig"
 CHATGPT_BOT = "@chatgpt"
 
 FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com"
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://my-bot-qkto.onrender.com")
 
 if not API_ID or not API_HASH or not SESSION_STRING:
-    raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING env vars missing hain!")
+    raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING missing hain!")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
+# ग्लोबल डिक्शनरी ताकि चैट आईडी और मैसेज ट्रैक रह सके
+PENDING_MEDIA = {}
+
+@app.route('/')
+def home():
+    return "Stream & Forwarder Bot is Running!"
+
 # -------------------------------------------------------------
-# Helper: चैप्टर नेम से एक्स्ट्रा कचरा/नंबर हटाने का फ़ंक्शन
+# 3. PROXY STREAMING ROUTE (बिना डिस्क में सेव किए डायरेक्ट स्ट्रीम)
+# -------------------------------------------------------------
+@app.route('/stream/<int:msg_id>')
+def stream_file(msg_id):
+    """ टेलीग्राम से डायरेक्ट बिना डाउनलोड किए चंक्स (Chunks) में स्ट्रीम करेगा """
+    async def generate():
+        async with client:
+            message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
+            if message and message.media:
+                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 1024):
+                    yield chunk
+
+    # Async generator को Flask Response में भेजना
+    return Response(asyncio.run_coroutine_threadsafe(generate(), client.loop).result(), 
+                    mimetype='application/octet-stream')
+
+
+# -------------------------------------------------------------
+# 4. HELPER: CHAPTER CLEANING
 # -------------------------------------------------------------
 def clean_chapter_name(raw_name):
     if not raw_name:
         return "Uncategorized"
-    
-    # 1. @ हटाएँ
     name = raw_name.replace("@", "").strip()
-    
-    # 2. 'Lec', 'Lecture', 'Part', '01-99' आदि एक्स्ट्रा शब्द हटाएँ
     name = re.sub(r'(?i)\b(lec|lecture|part|dpp|notes|class)\b.*', '', name)
-    
-    # 3. लास्ट के नंबर, स्पेशल कैरेक्टर (-, _, :, numbers) हटाएँ
     name = re.sub(r'[\d\-_\:()\[\]]+$', '', name).strip()
-    
-    # 4. अगर सफाई के बाद नाम खाली हो जाए तो डिफ़ॉल्ट दें
     return name if name else "Uncategorized"
 
 
 # -------------------------------------------------------------
-# 3. CHATGPT REPLY PARSER & FIREBASE PUSH
+# 5. FIREBASE PUSH WITH STREAM LINKS
 # -------------------------------------------------------------
-def process_reply_and_push_to_firebase(reply_text):
+def process_reply_and_push_to_firebase(reply_text, media_info):
     if not reply_text:
         return
 
     reply_clean = reply_text.strip().lower()
 
-    # 🛑 1. AI की सोचने वाली स्टेटस को इग्नोर करना
+    # AI सोचने वाली स्टेटस इग्नोर करें
     ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
     if any(ig in reply_clean for ig in ignore_list):
-        log.info("⏳ AI अभी सोच रहा है, इंतज़ार किया जा रहा है...")
+        log.info("⏳ AI जवाब जनरेट कर रहा है, इंतज़ार...")
         return
 
-    # 2. Content Type पहचानना
+    # Content Type
     if "@notes" in reply_clean:
         content_type = "@notes"
     elif "@dpp" in reply_clean:
@@ -77,13 +91,12 @@ def process_reply_and_push_to_firebase(reply_text):
     else:
         content_type = "video"
 
-    # 3. Lecture Number निकालना
+    # Lecture Tag
     lec_match = re.search(r'(@Lec\s*\d+|@L\d+|Lec\s*\d+)', reply_text, re.IGNORECASE)
     lec_tag = lec_match.group(1) if lec_match else ""
 
-    # 4. Tags Extractions
+    # Chapter Tag Extraction
     tags = re.findall(r'@[^\s@]+(?:\s+[^\s@]+)*', reply_text)
-    
     subject_name = "Biology"
     raw_chapter_name = ""
 
@@ -100,14 +113,12 @@ def process_reply_and_push_to_firebase(reply_text):
     elif len(valid_tags) == 1:
         raw_chapter_name = valid_tags[0]
 
-    # ✨ चैप्टर नेम की सफाई (ताकि एक्स्ट्रा टेक्स्ट होने पर भी सही फोल्डर मिले)
     chapter_name = clean_chapter_name(raw_chapter_name)
 
-    # Firebase Keys के लिए अमान्य कैरेक्टर्स (., $, #, [, ], /) हटाना
     subject_key = re.sub(r'[.$#\[\]/]', '', subject_name)
     chapter_key = re.sub(r'[.$#\[\]/]', '', chapter_name)
 
-    # 5. Firebase Payload Setup
+    # Payload
     data_payload = {
         "content_type": content_type,
         "lecture_no": lec_tag,
@@ -115,43 +126,63 @@ def process_reply_and_push_to_firebase(reply_text):
         "timestamp": {".sv": "timestamp"}
     }
 
+    # अगर फाइल/वीडियो अटैच है, तो उसका स्ट्रीम/डाउनलोड लिंक जोड़ें
+    if media_info and "stream_link" in media_info:
+        if content_type in ["@notes", "@dpp"]:
+            data_payload["download_link"] = media_info["stream_link"]
+        else:
+            data_payload["stream_link"] = media_info["stream_link"]
+
     firebase_url = f"{FIREBASE_BASE_URL}/{subject_key}/{chapter_key}.json"
 
     try:
         res = requests.post(firebase_url, json=data_payload)
         if res.status_code == 200:
-            log.info(f"🔥 Firebase Push Success: {subject_key} ➔ {chapter_key}")
+            log.info(f"🔥 Firebase Link & Data Push Success: {subject_key} ➔ {chapter_key}")
         else:
-            log.error(f"❌ Firebase Push Error: {res.status_code} - {res.text}")
+            log.error(f"❌ Firebase Error: {res.status_code} - {res.text}")
     except Exception as e:
         log.error(f"❌ Firebase Exception: {e}")
 
 
 # -------------------------------------------------------------
-# 4. EVENT HANDLERS
+# 6. TELETHON EVENTS
 # -------------------------------------------------------------
 @client.on(events.NewMessage(chats=SOURCE_CHAT))
 async def forward_to_chatgpt(event):
+    global PENDING_MEDIA
     try:
-        log.info(f"[+] Naya message mila: {event.text[:30]}...")
-        await client.send_message(CHATGPT_BOT, event.text)
-        log.info("➡️ ChatGPT bot ko message forward ho gaya!")
+        log.info(f"[+] Naya message mila (ID: {event.id})...")
+        
+        # अगर वीडियो/पीडीएफ अटैचमेंट है, तो स्ट्रीम लिंक बनाओ
+        stream_link = ""
+        if event.media:
+            stream_link = f"{RENDER_URL}/stream/{event.id}"
+            log.info(f"🔗 Proxy Stream Link Generated: {stream_link}")
+
+        PENDING_MEDIA['latest'] = {"stream_link": stream_link, "msg_id": event.id}
+
+        # ChatGPT को मैसेज भेजो
+        msg_text = event.text if event.text else "Media File Received"
+        await client.send_message(CHATGPT_BOT, msg_text)
+        log.info("➡️ ChatGPT bot ko query forward ho gayi!")
     except Exception as e:
-        log.error(f"❌ Forwarding Error: {e}")
+        log.error(f"❌ Forward Error: {e}")
 
 
 @client.on(events.NewMessage(chats=CHATGPT_BOT))
 @client.on(events.MessageEdited(chats=CHATGPT_BOT))
 async def handle_chatgpt_reply(event):
     try:
-        log.info(f"[+] AI Response: {event.text}")
-        process_reply_and_push_to_firebase(event.text)
+        log.info(f"[+] AI Reply: {event.text}")
+        media_info = PENDING_MEDIA.get('latest', {})
+        process_reply_and_push_to_firebase(event.text, media_info)
     except Exception as e:
         log.error(f"❌ Processing Error: {e}")
 
 
 # -------------------------------------------------------------
-# 5. MAIN RUNNER
+# 7. MAIN RUNNER
 # -------------------------------------------------------------
 async def main():
     import hypercorn.asyncio
@@ -160,14 +191,14 @@ async def main():
     config = Config()
     config.bind = [f"0.0.0.0:{os.environ.get('PORT', 10000)}"]
 
-    log.info("[+] Telethon client connect ho raha hai...")
+    log.info("[+] Telethon client connecting...")
     await client.connect()
 
     if not await client.is_user_authorized():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Clean Chapter Filter implementation Active!")
+    log.info("✅ Proxy Stream & Download Engine Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
