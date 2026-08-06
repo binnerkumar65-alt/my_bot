@@ -3,17 +3,15 @@ import re
 import asyncio
 import logging
 import requests
-from flask import Flask, Response, request
+from flask import Flask, Response, stream_with_context
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# 1. Flask App Setup
 app = Flask(__name__)
 
-# 2. Configuration
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -29,7 +27,6 @@ if not API_ID or not API_HASH or not SESSION_STRING:
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# ग्लोबल डिक्शनरी ताकि चैट आईडी और मैसेज ट्रैक रह सके
 PENDING_MEDIA = {}
 
 @app.route('/')
@@ -37,21 +34,36 @@ def home():
     return "Stream & Forwarder Bot is Running!"
 
 # -------------------------------------------------------------
-# 3. PROXY STREAMING ROUTE (बिना डिस्क में सेव किए डायरेक्ट स्ट्रीम)
+# 3. FIXED PROXY STREAMING ROUTE
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
 def stream_file(msg_id):
-    """ टेलीग्राम से डायरेक्ट बिना डाउनलोड किए चंक्स (Chunks) में स्ट्रीम करेगा """
-    async def generate():
-        async with client:
-            message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
-            if message and message.media:
-                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 1024):
-                    yield chunk
+    """ टेलीग्राम मीडिया को क्रैश-फ्री बफरिंग के साथ स्ट्रीम करने के लिए """
+    def generate():
+        async def fetch_and_yield():
+            try:
+                message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
+                if message and message.media:
+                    async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 512):
+                        yield chunk
+            except Exception as err:
+                log.error(f"Stream error: {err}")
 
-    # Async generator को Flask Response में भेजना
-    return Response(asyncio.run_coroutine_threadsafe(generate(), client.loop).result(), 
-                    mimetype='application/octet-stream')
+        # Async loop connection handling
+        loop = client.loop
+        async_gen = fetch_and_yield()
+
+        while True:
+            try:
+                chunk = loop.run_until_complete(async_gen.__anext__())
+                yield chunk
+            except StopAsyncIteration:
+                break
+            except Exception as e:
+                log.error(f"Iteration error: {e}")
+                break
+
+    return Response(stream_with_context(generate()), mimetype='application/octet-stream')
 
 
 # -------------------------------------------------------------
@@ -75,13 +87,11 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 
     reply_clean = reply_text.strip().lower()
 
-    # AI सोचने वाली स्टेटस इग्नोर करें
     ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
     if any(ig in reply_clean for ig in ignore_list):
-        log.info("⏳ AI जवाब जनरेट कर रहा है, इंतज़ार...")
+        log.info("⏳ AI जवाब तैयार कर रहा है...")
         return
 
-    # Content Type
     if "@notes" in reply_clean:
         content_type = "@notes"
     elif "@dpp" in reply_clean:
@@ -91,11 +101,9 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
     else:
         content_type = "video"
 
-    # Lecture Tag
     lec_match = re.search(r'(@Lec\s*\d+|@L\d+|Lec\s*\d+)', reply_text, re.IGNORECASE)
     lec_tag = lec_match.group(1) if lec_match else ""
 
-    # Chapter Tag Extraction
     tags = re.findall(r'@[^\s@]+(?:\s+[^\s@]+)*', reply_text)
     subject_name = "Biology"
     raw_chapter_name = ""
@@ -118,7 +126,6 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
     subject_key = re.sub(r'[.$#\[\]/]', '', subject_name)
     chapter_key = re.sub(r'[.$#\[\]/]', '', chapter_name)
 
-    # Payload
     data_payload = {
         "content_type": content_type,
         "lecture_no": lec_tag,
@@ -126,8 +133,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
         "timestamp": {".sv": "timestamp"}
     }
 
-    # अगर फाइल/वीडियो अटैच है, तो उसका स्ट्रीम/डाउनलोड लिंक जोड़ें
-    if media_info and "stream_link" in media_info:
+    if media_info and "stream_link" in media_info and media_info["stream_link"]:
         if content_type in ["@notes", "@dpp"]:
             data_payload["download_link"] = media_info["stream_link"]
         else:
@@ -138,7 +144,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
     try:
         res = requests.post(firebase_url, json=data_payload)
         if res.status_code == 200:
-            log.info(f"🔥 Firebase Link & Data Push Success: {subject_key} ➔ {chapter_key}")
+            log.info(f"🔥 Firebase Push Success: {subject_key} ➔ {chapter_key}")
         else:
             log.error(f"❌ Firebase Error: {res.status_code} - {res.text}")
     except Exception as e:
@@ -152,20 +158,18 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 async def forward_to_chatgpt(event):
     global PENDING_MEDIA
     try:
-        log.info(f"[+] Naya message mila (ID: {event.id})...")
+        log.info(f"[+] Naya message (ID: {event.id})...")
         
-        # अगर वीडियो/पीडीएफ अटैचमेंट है, तो स्ट्रीम लिंक बनाओ
         stream_link = ""
         if event.media:
             stream_link = f"{RENDER_URL}/stream/{event.id}"
-            log.info(f"🔗 Proxy Stream Link Generated: {stream_link}")
+            log.info(f"🔗 Generated Link: {stream_link}")
 
         PENDING_MEDIA['latest'] = {"stream_link": stream_link, "msg_id": event.id}
 
-        # ChatGPT को मैसेज भेजो
-        msg_text = event.text if event.text else "Media File Received"
+        msg_text = event.text if event.text else "Media File"
         await client.send_message(CHATGPT_BOT, msg_text)
-        log.info("➡️ ChatGPT bot ko query forward ho gayi!")
+        log.info("➡️ ChatGPT bot ko forward kiya!")
     except Exception as e:
         log.error(f"❌ Forward Error: {e}")
 
@@ -191,14 +195,14 @@ async def main():
     config = Config()
     config.bind = [f"0.0.0.0:{os.environ.get('PORT', 10000)}"]
 
-    log.info("[+] Telethon client connecting...")
+    log.info("[+] Telethon client connect ho raha hai...")
     await client.connect()
 
     if not await client.is_user_authorized():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Proxy Stream & Download Engine Active!")
+    log.info("✅ Fixed Proxy Stream Engine Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
