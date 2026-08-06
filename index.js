@@ -102,7 +102,7 @@ app.get("/stream/:msgId", async (req, res) => {
 
     const stream = client.iterDownload({
       file: media,
-      offset: BigInt(start),
+      offset: start,
       requestSize: 512 * 1024,
     });
 
@@ -159,7 +159,7 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   let subjectName = validTags[0] || "General";
   let chapterName = validTags[1] || "General_Lectures";
 
-  // Firebase Keys Cleanup (Firebase disallows ., $, #, [, ], /)
+  // Firebase Keys Cleanup
   const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
   const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
 
@@ -192,6 +192,7 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
   }
 }
+
 // -------------------------------------------------------------
 // 3. MAIN RUNNER & TELEGRAM EVENT LISTENER
 // -------------------------------------------------------------
@@ -205,10 +206,11 @@ async function startServer() {
       if (!message) return;
 
       const chat = await message.getChat();
-      if (!chat) return;
+      const sender = await message.getSender();
 
-      const chatUsername = (chat.username || "").toLowerCase();
-      const chatTitle = (chat.title || "").toLowerCase();
+      const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
+      const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
+      const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
 
       // 1. Check Channel Message (@sxhckfufig)
       const isSourceChat = 
@@ -234,10 +236,12 @@ async function startServer() {
         return;
       }
 
-      // 2. Check ChatGPT Reply (@chatgpt ya ChatGPT naam ka koi bot)
+      // 2. Check ChatGPT Reply
       const isChatGPT = 
         chatUsername.includes("chatgpt") || 
-        chatTitle.includes("chatgpt");
+        chatTitle.includes("chatgpt") ||
+        senderUsername.includes("chatgpt") ||
+        CHATGPT_BOT.toLowerCase().includes(senderUsername);
 
       if (isChatGPT) {
         console.log(`\n🤖 [STEP 3] ChatGPT Response Aaya: "${message.text}"`);
@@ -258,4 +262,3 @@ async function startServer() {
 }
 
 startServer();
-
