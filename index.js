@@ -11,6 +11,7 @@ const { StringSession } = require("telegram/sessions");
 const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
+const bigInt = require("big-integer");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -91,7 +92,7 @@ app.get("/stream/:msgId", async (req, res) => {
 
       const stream = client.iterDownload({
         file: media,
-        offset: start,
+        offset: bigInt(start),
         limit: chunkSize,
       });
 
@@ -108,7 +109,7 @@ app.get("/stream/:msgId", async (req, res) => {
         "Content-Disposition": `inline; filename="${fileName}"`,
       });
 
-      const stream = client.iterDownload({ file: media });
+      const stream = client.iterDownload({ file: media, offset: bigInt(0) });
 
       for await (const chunk of stream) {
         res.write(chunk);
