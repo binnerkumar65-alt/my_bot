@@ -36,13 +36,16 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let pendingMedia = {};
 
+// Resolved once at startup - used for reliable ChatGPT bot detection
+let chatgptBotId = null;
+
 // Root Check for Render Health Check
 app.get("/", (req, res) => {
   res.send("Node.js Proxy & Bot is Active!");
 });
 
 // -------------------------------------------------------------
-// 1. STREAMING & DOWNLOAD ROUTE
+// 1. STREAMING & DOWNLOAD ROUTE (chunked + Range support)
 // -------------------------------------------------------------
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -58,9 +61,11 @@ app.get("/stream/:msgId", async (req, res) => {
     const media = message.media;
     let mimeType = "video/mp4";
     let fileName = `file_${msgId}.mp4`;
+    let fileSize = 0;
 
     if (media.document) {
       mimeType = media.document.mimeType || "video/mp4";
+      fileSize = Number(media.document.size) || 0;
       if (media.document.attributes) {
         for (const attr of media.document.attributes) {
           if (attr.fileName) fileName = attr.fileName;
@@ -68,16 +73,48 @@ app.get("/stream/:msgId", async (req, res) => {
       }
     }
 
-    res.setHeader("Content-Type", mimeType);
-    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+    const range = req.headers.range;
 
-    const buffer = await client.downloadMedia(message);
-    if (!buffer) {
-      return res.status(500).send("Unable to download media from Telegram");
+    if (range && fileSize) {
+      // Partial content request (seeking / progressive playback)
+      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+      const chunkSize = end - start + 1;
+
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": mimeType,
+      });
+
+      const stream = client.iterDownload({
+        file: media,
+        offset: start,
+        limit: chunkSize,
+      });
+
+      for await (const chunk of stream) {
+        res.write(chunk);
+      }
+      res.end();
+    } else {
+      // Full file request, still streamed in chunks (not buffered fully first)
+      res.writeHead(200, {
+        "Content-Type": mimeType,
+        "Content-Length": fileSize,
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": `inline; filename="${fileName}"`,
+      });
+
+      const stream = client.iterDownload({ file: media });
+
+      for await (const chunk of stream) {
+        res.write(chunk);
+      }
+      res.end();
     }
-
-    return res.send(buffer);
-
   } catch (err) {
     console.error("❌ Stream Route Error:", err);
     if (!res.headersSent) {
@@ -172,15 +209,18 @@ async function handleIncomingMessage(event) {
     const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
     const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
     const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
+    const senderId = sender && sender.id ? sender.id.toString() : "";
+
+    console.log(`🔍 DEBUG chat=${chatUsername} title=${chatTitle} sender=${senderUsername} senderId=${senderId}`);
 
     // A. Source Channel Check
-    const isSourceChat = 
-      chatUsername === "sxhckfufig" || 
+    const isSourceChat =
+      chatUsername === "sxhckfufig" ||
       chatTitle.includes("sxhckfufig");
 
     if (isSourceChat) {
       console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
-      
+
       let streamLink = "";
       if (message.media) {
         streamLink = `${RENDER_URL}/stream/${message.id}`;
@@ -191,18 +231,14 @@ async function handleIncomingMessage(event) {
 
       const chatgptEntity = await client.getEntity(CHATGPT_BOT);
       const msgText = currentText || "Media File";
-      
+
       await client.sendMessage(chatgptEntity, { message: msgText });
       console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
       return;
     }
 
-    // B. ChatGPT Response Check
-    const isChatGPT = 
-      chatUsername.includes("chatgpt") || 
-      chatTitle.includes("chatgpt") ||
-      senderUsername.includes("chatgpt") ||
-      CHATGPT_BOT.toLowerCase().includes(senderUsername);
+    // B. ChatGPT Response Check - matched reliably via resolved bot ID
+    const isChatGPT = chatgptBotId && senderId === chatgptBotId;
 
     if (isChatGPT) {
       console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${currentText}"`);
@@ -229,9 +265,18 @@ async function startServer() {
     await client.connect();
     console.log("✅ Telegram Client Connected!");
 
+    // Resolve the ChatGPT bot's numeric ID once - used for reliable matching
+    try {
+      const botEntity = await client.getEntity(CHATGPT_BOT);
+      chatgptBotId = botEntity.id.toString();
+      console.log("🤖 ChatGPT Bot ID resolved:", chatgptBotId);
+    } catch (e) {
+      console.error("❌ ChatGPT Bot ID resolve nahi hua:", e.message);
+    }
+
     // Safely add event handlers for New Message and Edited Message
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    
+
     try {
       client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
     } catch (e) {
