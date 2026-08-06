@@ -23,7 +23,7 @@ FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com"
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://my-bot-qkto.onrender.com")
 
 if not API_ID or not API_HASH or not SESSION_STRING:
-    raise RuntimeError("API_ID, API_HASH, या SESSION_STRING मिसिंग हैं!")
+    raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING missing hain!")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -34,7 +34,7 @@ async def home():
     return "Stream & Forwarder Bot is Active!"
 
 # -------------------------------------------------------------
-# 3. ADVANCED MEDIA ROUTE (Range-based Video Stream + Fast PDF)
+# 3. DIRECT PROXY STREAM ROUTE (HYPERCORN ERROR FIXED)
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
 async def stream_file(msg_id):
@@ -43,71 +43,56 @@ async def stream_file(msg_id):
         if not message or not message.media:
             return "Media not found", 404
 
-        file_size = 0
-        mime_type = "application/octet-stream"
-        file_name = f"file_{msg_id}"
+        file_size = getattr(message.media, 'document', None)
+        total_bytes = file_size.size if file_size else 0
+        mime_type = getattr(file_size, 'mime_type', 'video/mp4') or 'video/mp4'
 
-        if hasattr(message.media, 'document'):
-            doc = message.media.document
-            file_size = doc.size
-            mime_type = doc.mime_type or mime_type
-            for attr in doc.attributes:
-                if hasattr(attr, 'file_name') and attr.file_name:
-                    file_name = attr.file_name
-
-        # 📄 PDF / Documents Solution (यह पहले से सही काम कर रहा है)
-        if "pdf" in mime_type.lower() or "document" in mime_type.lower():
-            file_bytes = await client.download_media(message, file=bytes)
-            return Response(
-                file_bytes,
-                mimetype=mime_type,
-                headers={
-                    "Content-Disposition": f'attachment; filename="{file_name}"',
-                    "Content-Length": str(len(file_bytes))
-                }
-            )
-
-        # 🎥 Video Seeking & Fast Proxy Stream (502 Timeout Fix)
         range_header = request.headers.get('Range', None)
-        
-        start_bytes = 0
-        end_bytes = file_size - 1 if file_size > 0 else 0
+        start = 0
+        end = total_bytes - 1 if total_bytes > 0 else 0
 
         if range_header:
             match = re.search(r'bytes=(\d+)-(\d*)', range_header)
             if match:
-                start_bytes = int(match.group(1))
+                start = int(match.group(1))
                 if match.group(2):
-                    end_bytes = int(match.group(2))
+                    end = int(match.group(2))
 
-        chunk_len = end_bytes - start_bytes + 1
+        if start >= total_bytes and total_bytes > 0:
+            start = 0
 
-        async def generate_video_chunks():
+        content_length = (end - start) + 1 if total_bytes > 0 else 0
+
+        async def file_generator():
             try:
-                # Telethon se specific byte-offset seek karke chunk manga rahe hain
+                # Telethon offset chunk stream
                 async for chunk in client.download_media(
-                    message, 
-                    file=bytes, 
-                    offset=start_bytes, 
+                    message,
+                    file=bytes,
+                    offset=start,
                     chunk_size=1024 * 512
                 ):
                     yield chunk
             except Exception as e:
-                log.error(f"Video Chunk Streaming Error: {e}")
+                log.error(f"Stream Generator Error: {e}")
 
-        status_code = 206 if range_header else 200
         headers = {
-            "Content-Type": "video/mp4",
-            "Content-Disposition": f'inline; filename="{file_name}.mp4"',
+            "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
-            "Content-Range": f"bytes {start_bytes}-{end_bytes}/{file_size if file_size else '*'}",
-            "Content-Length": str(chunk_len) if file_size > 0 else ""
+            "Content-Disposition": "inline",
         }
 
-        return Response(generate_video_chunks(), status=status_code, headers=headers)
+        if range_header and total_bytes > 0:
+            headers["Content-Range"] = f"bytes {start}-{end}/{total_bytes}"
+            headers["Content-Length"] = str(content_length)
+            return Response(file_generator(), status=206, headers=headers)
+        else:
+            if total_bytes > 0:
+                headers["Content-Length"] = str(total_bytes)
+            return Response(file_generator(), status=200, headers=headers)
 
     except Exception as e:
-        log.error(f"Stream Exception: {e}")
+        log.error(f"Stream Route Error: {e}")
         return f"Streaming Error: {str(e)}", 500
 
 
@@ -247,7 +232,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Range-Supported Video Proxy Server Ready!")
+    log.info("✅ Proxy Stream Server Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
