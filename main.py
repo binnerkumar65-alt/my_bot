@@ -5,8 +5,8 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # Environment Variables से डेटा उठाएगा
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
+API_ID = int(os.environ.get("30414263"))
+API_HASH = os.environ.get("7ac29590d4ad54e141856dfa4cc04dac")
 SESSION_STRING = os.environ.get("SESSION_STRING")
 
 # Target Details
