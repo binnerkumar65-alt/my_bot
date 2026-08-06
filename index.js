@@ -296,14 +296,26 @@ async function startServer() {
       console.error("❌ ChatGPT Bot ID resolve nahi hua:", e.message);
     }
 
-    // Safely add event handlers for New Message and Edited Message
+    // New messages
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
 
-    try {
-      client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
-    } catch (e) {
-      console.log("⚠️ EditedMessage direct constructor not supported, using fallback handler.");
-    }
+    // Edited messages (ChatGPT bot edits its "सोच..." placeholder into the
+    // final tagged answer, it does NOT send a new message). Listening on
+    // raw updates directly is more reliable than the EditedMessage event
+    // class, which can silently fail to register depending on library version.
+    client.addEventHandler(async (update) => {
+      try {
+        if (
+          update.className === "UpdateEditMessage" ||
+          update.className === "UpdateEditChannelMessage"
+        ) {
+          console.log("✏️ Raw Edit Update Detect Hua, message process kar rahe hain...");
+          await handleIncomingMessage({ message: update.message });
+        }
+      } catch (e) {
+        console.error("❌ Raw Edit Handler Error:", e);
+      }
+    });
 
     console.log("🤖 Event Handlers Successfully Registered!");
   } catch (err) {
