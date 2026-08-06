@@ -3,7 +3,7 @@ import re
 import asyncio
 import logging
 import requests
-from quart import Quart, Response, stream_with_context
+from quart import Quart, Response, request
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -31,48 +31,63 @@ PENDING_MEDIA = {}
 
 @app.route('/')
 async def home():
-    return "Stream & Forwarder Bot is Running Perfectly!"
+    return "Stream & Forwarder Bot is Active!"
 
 # -------------------------------------------------------------
-# 3. FIXED PROXY STREAMING & PLAYBACK ROUTE
+# 3. FIXED MEDIA ROUTE (PDF Download + Stream support)
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
 async def stream_file(msg_id):
-    """ Telegram media ko browser me direct play/view karne ke liye """
     try:
         message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
         if not message or not message.media:
             return "Media not found", 404
 
-        # File Mime-Type Pehchanna (Video / PDF / Document)
-        mime_type = "video/mp4" # Default for Video
-        file_name = "media_file"
+        # 1. File size & Mime Type निकालना
+        file_size = 0
+        mime_type = "application/octet-stream"
+        file_name = f"file_{msg_id}"
 
         if hasattr(message.media, 'document'):
-            mime_type = message.media.document.mime_type or "video/mp4"
-            for attr in message.media.document.attributes:
+            doc = message.media.document
+            file_size = doc.size
+            mime_type = doc.mime_type or mime_type
+            for attr in doc.attributes:
                 if hasattr(attr, 'file_name') and attr.file_name:
                     file_name = attr.file_name
 
+        # PDF / Documents के लिए: Direct Fast Download (Browser Error Fix)
+        if "pdf" in mime_type.lower() or "document" in mime_type.lower():
+            file_bytes = await client.download_media(message, file=bytes)
+            return Response(
+                file_bytes,
+                mimetype=mime_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{file_name}"',
+                    "Content-Length": str(len(file_bytes))
+                }
+            )
+
+        # Video Streaming के लिए Buffer Delivery
         async def generate():
             try:
-                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 512):
+                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 256):
                     yield chunk
             except Exception as e:
-                log.error(f"Streaming Chunk Error: {e}")
+                log.error(f"Chunk Error: {e}")
 
-        # Proper Headers for In-Browser Playback and Streaming
         headers = {
             "Content-Type": mime_type,
             "Content-Disposition": f'inline; filename="{file_name}"',
+            "Content-Length": str(file_size) if file_size else "",
             "Accept-Ranges": "bytes"
         }
 
-        return Response(stream_with_context(generate)(), headers=headers)
+        return Response(generate(), headers=headers)
 
     except Exception as e:
-        log.error(f"Streaming Exception: {e}")
-        return f"Error: {str(e)}", 500
+        log.error(f"Stream Exception: {e}")
+        return f"Streaming Error: {str(e)}", 500
 
 
 # -------------------------------------------------------------
@@ -98,7 +113,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 
     ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
     if any(ig in reply_clean for ig in ignore_list):
-        log.info("⏳ AI jawaab bana raha hai...")
+        log.info("⏳ AI जवाब तैयार कर रहा है...")
         return
 
     if "@notes" in reply_clean:
@@ -167,7 +182,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 async def forward_to_chatgpt(event):
     global PENDING_MEDIA
     try:
-        log.info(f"[+] Naya message mila (ID: {event.id})...")
+        log.info(f"[+] Naya message (ID: {event.id})...")
         
         stream_link = ""
         if event.media:
@@ -178,7 +193,7 @@ async def forward_to_chatgpt(event):
 
         msg_text = event.text if event.text else "Media File"
         await client.send_message(CHATGPT_BOT, msg_text)
-        log.info("➡️ ChatGPT bot ko query bheji gayi!")
+        log.info("➡️ ChatGPT bot ko query bheji!")
     except Exception as e:
         log.error(f"❌ Forward Error: {e}")
 
@@ -211,7 +226,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Direct Media Playback & Stream Engine Active!")
+    log.info("✅ Stable Media Engine Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
