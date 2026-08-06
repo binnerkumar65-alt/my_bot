@@ -1,7 +1,7 @@
 {
-  "name": "telegram-stream-forwarder",
+  "name": "telegram-stream-bot",
   "version": "1.0.0",
-  "description": "Telegram Video Streaming & Firebase Forwarder Bot",
+  "description": "Telegram Streaming Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,8 +9,6 @@
   "dependencies": {
     "express": "^4.18.2",
     "telegram": "^2.22.2",
-    "telegram-file-stream": "^1.1.2",
-    "axios": "^1.6.8",
-    "dotenv": "^16.4.5"
+    "input": "^1.0.1"
   }
 }
