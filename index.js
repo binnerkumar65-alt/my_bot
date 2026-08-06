@@ -13,6 +13,8 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
+
+// Render स्वतः ही PORT पर्यावरण चर (Environment Variable) प्रदान करता है
 const PORT = process.env.PORT || 10000;
 
 // Environment Variables Configuration
@@ -23,7 +25,7 @@ const stringSession = new StringSession(process.env.SESSION_STRING || "");
 const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-ck6m.onrender.com";
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
 
 if (!apiId || !apiHash) {
   console.error("❌ API_ID या API_HASH missing हैं!");
@@ -36,7 +38,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let pendingMedia = {};
 
-// Root Check
+// Root Check for Render Port Health Check
 app.get("/", (req, res) => {
   res.send("Node.js Proxy & Bot is Active!");
 });
@@ -211,16 +213,25 @@ async function handleIncomingMessage(event) {
   }
 }
 
+// -------------------------------------------------------------
+// 4. SERVER STARTUP (Render Binding Fix Included)
+// -------------------------------------------------------------
 async function startServer() {
-  await client.connect();
-  console.log("✅ Telegram Client Connected!");
-
-  client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-  client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
-
-  app.listen(PORT, () => {
-    console.log(`🚀 Server Running on Port ${PORT}`);
+  // पहले वेब सर्वर चालू करें ताकि Render पोर्ट डिटेक्ट करके Live कर दे
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
   });
+
+  // फिर टेलीग्राम क्लाइंट से कनेक्ट करें
+  try {
+    await client.connect();
+    console.log("✅ Telegram Client Connected!");
+
+    client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+    client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
+  } catch (err) {
+    console.error("❌ Telegram Client Connection Error:", err);
+  }
 }
 
 startServer();
