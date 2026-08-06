@@ -3,15 +3,17 @@ import re
 import asyncio
 import logging
 import requests
-from flask import Flask, Response, stream_with_context
+from quart import Quart, Response, stream_with_context
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# 1. Quart Async App (Flask ka Native Async Version)
+app = Quart(__name__)
 
+# 2. Configuration
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -30,40 +32,29 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 PENDING_MEDIA = {}
 
 @app.route('/')
-def home():
-    return "Stream & Forwarder Bot is Running!"
+async def home():
+    return "Stream & Forwarder Bot is Running Perfectly!"
 
 # -------------------------------------------------------------
-# 3. FIXED PROXY STREAMING ROUTE
+# 3. ASYNC PROXY STREAMING ROUTE (Crash-Free Buffer Stream)
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
-def stream_file(msg_id):
-    """ टेलीग्राम मीडिया को क्रैश-फ्री बफरिंग के साथ स्ट्रीम करने के लिए """
-    def generate():
-        async def fetch_and_yield():
-            try:
-                message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
-                if message and message.media:
-                    async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 512):
-                        yield chunk
-            except Exception as err:
-                log.error(f"Stream error: {err}")
+async def stream_file(msg_id):
+    """ Telegram se direct chunks me stream bina disk use kiye """
+    
+    async def generate():
+        try:
+            message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
+            if message and message.media:
+                async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 512):
+                    yield chunk
+            else:
+                yield b"Media message not found"
+        except Exception as e:
+            log.error(f"Streaming Exception: {e}")
+            yield f"Error streaming file: {str(e)}".encode()
 
-        # Async loop connection handling
-        loop = client.loop
-        async_gen = fetch_and_yield()
-
-        while True:
-            try:
-                chunk = loop.run_until_complete(async_gen.__anext__())
-                yield chunk
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                log.error(f"Iteration error: {e}")
-                break
-
-    return Response(stream_with_context(generate()), mimetype='application/octet-stream')
+    return Response(stream_with_context(generate)(), mimetype='application/octet-stream')
 
 
 # -------------------------------------------------------------
@@ -79,7 +70,7 @@ def clean_chapter_name(raw_name):
 
 
 # -------------------------------------------------------------
-# 5. FIREBASE PUSH WITH STREAM LINKS
+# 5. FIREBASE PUSH LOGIC
 # -------------------------------------------------------------
 def process_reply_and_push_to_firebase(reply_text, media_info):
     if not reply_text:
@@ -89,7 +80,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 
     ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
     if any(ig in reply_clean for ig in ignore_list):
-        log.info("⏳ AI जवाब तैयार कर रहा है...")
+        log.info("⏳ AI jawaab bana raha hai...")
         return
 
     if "@notes" in reply_clean:
@@ -158,7 +149,7 @@ def process_reply_and_push_to_firebase(reply_text, media_info):
 async def forward_to_chatgpt(event):
     global PENDING_MEDIA
     try:
-        log.info(f"[+] Naya message (ID: {event.id})...")
+        log.info(f"[+] Naya message mila (ID: {event.id})...")
         
         stream_link = ""
         if event.media:
@@ -169,7 +160,7 @@ async def forward_to_chatgpt(event):
 
         msg_text = event.text if event.text else "Media File"
         await client.send_message(CHATGPT_BOT, msg_text)
-        log.info("➡️ ChatGPT bot ko forward kiya!")
+        log.info("➡️ ChatGPT bot ko query bheji gayi!")
     except Exception as e:
         log.error(f"❌ Forward Error: {e}")
 
@@ -202,7 +193,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Fixed Proxy Stream Engine Active!")
+    log.info("✅ Quart Async Stream Server Ready & Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
