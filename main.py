@@ -59,7 +59,7 @@ async def forward_handler(event):
 # -------------------------------------------------------------
 async def main():
     print("[+] Telethon Client कनेक्ट हो रहा है...")
-    await client.start()
+    await client.connect()
     print("✅ Telethon सफलतापूर्वक लॉगिन हो गया है! मैसेज सुनने के लिए तैयार...")
     await client.run_until_disconnected()
 
