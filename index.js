@@ -140,26 +140,42 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 
   console.log(`📩 ChatGPT का असली जवाब: "${replyText}"`);
 
+  // Split on "@" instead of whitespace, so multi-word tags
+  // (e.g. "@वनस्पति जगत") are captured fully, not cut at the first space.
+  const segments = replyText
+    .split("@")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const devanagariRegex = /[\u0900-\u097F]/; // Hindi script range
+
   let contentType = "@other";
-  if (replyClean.includes("@dpp")) contentType = "@dpp";
-  else if (replyClean.includes("@notes")) contentType = "@notes";
+  let lecTag = "";
+  let subjectName = "";
+  let chapterName = "";
 
-  const lecMatch = replyText.match(/@Lec\s*\d+/i);
-  const lecTag = lecMatch ? lecMatch[0] : "";
+  for (const seg of segments) {
+    const segLower = seg.toLowerCase();
 
-  const rawTags = replyText.match(/@[^\s@]+/g) || [];
-  const systemTags = ["@dpp", "@notes", "@other"];
-  const validTags = [];
-
-  for (const tag of rawTags) {
-    const tLower = tag.toLowerCase();
-    if (!systemTags.includes(tLower) && !tLower.startsWith("@lec")) {
-      validTags.push(tag.replace("@", "").trim());
+    if (segLower.startsWith("dpp") || segLower.includes("practice sheet")) {
+      contentType = "@dpp";
+    } else if (segLower.startsWith("notes")) {
+      contentType = "@notes";
+    } else if (segLower.startsWith("other")) {
+      contentType = "@other";
+    } else if (segLower.startsWith("lec")) {
+      lecTag = "@" + seg;
+    } else if (devanagariRegex.test(seg)) {
+      // Hindi script tag => always the chapter name, regardless of position
+      chapterName = seg;
+    } else if (!subjectName) {
+      // First remaining non-system, non-Hindi tag => subject
+      subjectName = seg;
     }
   }
 
-  let subjectName = validTags[0] || "General";
-  let chapterName = validTags[1] || "General_Lectures";
+  subjectName = subjectName || "General";
+  chapterName = chapterName || "General_Lectures";
 
   const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
   const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
