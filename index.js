@@ -39,6 +39,8 @@ let pendingMedia = {};
 
 // Resolved once at startup - used for reliable ChatGPT bot detection
 let chatgptBotId = null;
+// Resolved once at startup - used for reliable source-channel detection
+let sourceChatId = null;
 
 // Root Check for Render Health Check
 app.get("/", (req, res) => {
@@ -225,18 +227,35 @@ async function handleIncomingMessage(event) {
 
     const currentText = message.text || message.message || "";
 
-    const chat = await message.getChat();
-    const sender = await message.getSender();
+    // IMPORTANT: message.chatId aur message.senderId SYNCHRONOUS getters hain
+    // (koi network call nahi) - ye raw edit updates par bhi reliably kaam karte
+    // hain. Purana code await message.getChat()/getSender() use karta tha, jo
+    // network-fetch pe depend karta hai aur EDIT event par blank/fail ho jaata
+    // tha - isi wajah se ChatGPT ka final (edited) jawab silently drop ho raha
+    // tha aur Firebase tak nahi pahunchta tha.
+    const chatIdStr = message.chatId ? message.chatId.toString() : "";
+    const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
-    const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
-    const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
-    const senderId = sender && sender.id ? sender.id.toString() : "";
+    // Debug/logging ke liye purana getChat/getSender bhi try karo, lekin
+    // isse koi core-logic decision mat lo - agar fail ho to bhi flow rukna
+    // nahi chahiye.
+    let chatUsername = "", chatTitle = "", senderUsername = "";
+    try {
+      const chat = await message.getChat();
+      chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
+      chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
+    } catch (e) { /* ignore - sirf logging ke liye tha */ }
+    try {
+      const sender = await message.getSender();
+      senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
+    } catch (e) { /* ignore - sirf logging ke liye tha */ }
 
-    console.log(`🔍 DEBUG chat=${chatUsername} title=${chatTitle} sender=${senderUsername} senderId=${senderId} msgId=${message.id} isEdited=${!!message.editDate} editDate=${message.editDate || "N/A"}`);
+    console.log(`🔍 DEBUG chat=${chatUsername} title=${chatTitle} sender=${senderUsername} chatId=${chatIdStr} senderId=${senderIdSync} msgId=${message.id} isEdited=${!!message.editDate} editDate=${message.editDate || "N/A"}`);
 
-    // A. Source Channel Check
+    // A. Source Channel Check - resolved numeric ID se compare karo (reliable),
+    // username/title text-match ko fallback ke taur pe rakha hai.
     const isSourceChat =
+      (sourceChatId && chatIdStr === sourceChatId) ||
       chatUsername === "sxhckfufig" ||
       chatTitle.includes("sxhckfufig");
 
@@ -259,8 +278,11 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // B. ChatGPT Response Check - matched reliably via resolved bot ID
-    const isChatGPT = chatgptBotId && senderId === chatgptBotId;
+    // B. ChatGPT Response Check - matched reliably via resolved bot ID.
+    // senderIdSync (synchronous getter) is used here specifically because it
+    // still resolves correctly on EDIT events, unlike the old getSender()
+    // based value which came back blank on edits.
+    const isChatGPT = chatgptBotId && senderIdSync === chatgptBotId;
 
     if (isChatGPT) {
       console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${currentText}"`);
@@ -294,6 +316,15 @@ async function startServer() {
       console.log("🤖 ChatGPT Bot ID resolved:", chatgptBotId);
     } catch (e) {
       console.error("❌ ChatGPT Bot ID resolve nahi hua:", e.message);
+    }
+
+    // Resolve the source channel's numeric ID once - used for reliable matching
+    try {
+      const sourceEntity = await client.getEntity(SOURCE_CHAT);
+      sourceChatId = sourceEntity.id.toString();
+      console.log("📡 Source Chat ID resolved:", sourceChatId);
+    } catch (e) {
+      console.error("❌ Source Chat ID resolve nahi hua:", e.message);
     }
 
     // New messages
