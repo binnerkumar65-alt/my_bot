@@ -23,7 +23,7 @@ API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 SOURCE_CHAT = "@sxhckfufig"
-CHATGPT_BOT = "@chatgpt"  # AI Bot username
+CHATGPT_BOT = "@chatgpt"
 
 FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com"
 
@@ -31,6 +31,25 @@ if not API_ID or not API_HASH or not SESSION_STRING:
     raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING env vars missing hain!")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+# -------------------------------------------------------------
+# Helper: चैप्टर नेम से एक्स्ट्रा कचरा/नंबर हटाने का फ़ंक्शन
+# -------------------------------------------------------------
+def clean_chapter_name(raw_name):
+    if not raw_name:
+        return "Uncategorized"
+    
+    # 1. @ हटाएँ
+    name = raw_name.replace("@", "").strip()
+    
+    # 2. 'Lec', 'Lecture', 'Part', '01-99' आदि एक्स्ट्रा शब्द हटाएँ
+    name = re.sub(r'(?i)\b(lec|lecture|part|dpp|notes|class)\b.*', '', name)
+    
+    # 3. लास्ट के नंबर, स्पेशल कैरेक्टर (-, _, :, numbers) हटाएँ
+    name = re.sub(r'[\d\-_\:()\[\]]+$', '', name).strip()
+    
+    # 4. अगर सफाई के बाद नाम खाली हो जाए तो डिफ़ॉल्ट दें
+    return name if name else "Uncategorized"
 
 
 # -------------------------------------------------------------
@@ -42,10 +61,10 @@ def process_reply_and_push_to_firebase(reply_text):
 
     reply_clean = reply_text.strip().lower()
 
-    # 🛑 1. AI की प्रोसेसिंग/सोचने वाली स्टेटस को रिजेक्ट करें
+    # 🛑 1. AI की सोचने वाली स्टेटस को इग्नोर करना
     ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
     if any(ig in reply_clean for ig in ignore_list):
-        log.info("⏳ AI अभी सोच रहा है, फाइनल उत्तर का इंतज़ार किया जा रहा है...")
+        log.info("⏳ AI अभी सोच रहा है, इंतज़ार किया जा रहा है...")
         return
 
     # 2. Content Type पहचानना
@@ -56,23 +75,39 @@ def process_reply_and_push_to_firebase(reply_text):
     elif "@other" in reply_clean:
         content_type = "@other"
     else:
-        content_type = "video"  # अगर तीनों में से कुछ न मिले तो Video
+        content_type = "video"
 
     # 3. Lecture Number निकालना
     lec_match = re.search(r'(@Lec\s*\d+|@L\d+|Lec\s*\d+)', reply_text, re.IGNORECASE)
     lec_tag = lec_match.group(1) if lec_match else ""
 
-    # 4. Chapter Name निकालना (@ से शुरू होने वाला नाम)
-    tags = re.findall(r'@\w+', reply_text)
-    chapter_name = "Uncategorized"
+    # 4. Tags Extractions
+    tags = re.findall(r'@[^\s@]+(?:\s+[^\s@]+)*', reply_text)
     
-    for tag in tags:
-        tag_lower = tag.lower()
-        if tag_lower not in ["@notes", "@dpp", "@other"] and not tag_lower.startswith("@lec"):
-            chapter_name = tag.replace("@", "").strip()
-            break
+    subject_name = "Biology"
+    raw_chapter_name = ""
 
-    # 5. Firebase में Save करने के लिए Data Payload
+    valid_tags = []
+    for tag in tags:
+        t_clean = tag.strip()
+        t_lower = t_clean.lower()
+        if t_lower not in ["@notes", "@dpp", "@other"] and not t_lower.startswith("@lec"):
+            valid_tags.append(t_clean)
+
+    if len(valid_tags) >= 2:
+        subject_name = valid_tags[0].replace("@", "").strip()
+        raw_chapter_name = valid_tags[1]
+    elif len(valid_tags) == 1:
+        raw_chapter_name = valid_tags[0]
+
+    # ✨ चैप्टर नेम की सफाई (ताकि एक्स्ट्रा टेक्स्ट होने पर भी सही फोल्डर मिले)
+    chapter_name = clean_chapter_name(raw_chapter_name)
+
+    # Firebase Keys के लिए अमान्य कैरेक्टर्स (., $, #, [, ], /) हटाना
+    subject_key = re.sub(r'[.$#\[\]/]', '', subject_name)
+    chapter_key = re.sub(r'[.$#\[\]/]', '', chapter_name)
+
+    # 5. Firebase Payload Setup
     data_payload = {
         "content_type": content_type,
         "lecture_no": lec_tag,
@@ -80,12 +115,12 @@ def process_reply_and_push_to_firebase(reply_text):
         "timestamp": {".sv": "timestamp"}
     }
 
-    firebase_url = f"{FIREBASE_BASE_URL}/{chapter_name}.json"
+    firebase_url = f"{FIREBASE_BASE_URL}/{subject_key}/{chapter_key}.json"
 
     try:
         res = requests.post(firebase_url, json=data_payload)
         if res.status_code == 200:
-            log.info(f"🔥 Firebase me Chapter '{chapter_name}' ke andar FINAL data push ho gaya!")
+            log.info(f"🔥 Firebase Push Success: {subject_key} ➔ {chapter_key}")
         else:
             log.error(f"❌ Firebase Push Error: {res.status_code} - {res.text}")
     except Exception as e:
@@ -95,19 +130,16 @@ def process_reply_and_push_to_firebase(reply_text):
 # -------------------------------------------------------------
 # 4. EVENT HANDLERS
 # -------------------------------------------------------------
-
-# Step A: Source Channel से मैसेज AI बॉट को भेजना
 @client.on(events.NewMessage(chats=SOURCE_CHAT))
 async def forward_to_chatgpt(event):
     try:
-        log.info(f"[+] Naya message mila, ChatGPT ko bhej rahe hain: {event.text[:30]}...")
+        log.info(f"[+] Naya message mila: {event.text[:30]}...")
         await client.send_message(CHATGPT_BOT, event.text)
         log.info("➡️ ChatGPT bot ko message forward ho gaya!")
     except Exception as e:
         log.error(f"❌ Forwarding Error: {e}")
 
 
-# Step B: AI का नया मैसेज या एडिटेड मैसेज पकड़ना
 @client.on(events.NewMessage(chats=CHATGPT_BOT))
 @client.on(events.MessageEdited(chats=CHATGPT_BOT))
 async def handle_chatgpt_reply(event):
@@ -135,7 +167,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Bot fully active and connected to Firebase flow!")
+    log.info("✅ Clean Chapter Filter implementation Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
