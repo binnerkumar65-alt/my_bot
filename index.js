@@ -102,11 +102,16 @@ app.get("/stream/:msgId", async (req, res) => {
       res.end();
     } else {
       // Full file request, still streamed in chunks (not buffered fully first)
+      // Non-ASCII filenames (Hindi text etc.) must be encoded - raw
+      // Content-Disposition headers only accept ASCII characters.
+      const asciiFallback = fileName.replace(/[^\x20-\x7E]/g, "_");
+      const encodedName = encodeURIComponent(fileName);
+
       res.writeHead(200, {
         "Content-Type": mimeType,
         "Content-Length": fileSize,
         "Accept-Ranges": "bytes",
-        "Content-Disposition": `inline; filename="${fileName}"`,
+        "Content-Disposition": `inline; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`,
       });
 
       const stream = client.iterDownload({ file: media, offset: bigInt(0) });
@@ -228,7 +233,7 @@ async function handleIncomingMessage(event) {
     const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
     const senderId = sender && sender.id ? sender.id.toString() : "";
 
-    console.log(`🔍 DEBUG chat=${chatUsername} title=${chatTitle} sender=${senderUsername} senderId=${senderId}`);
+    console.log(`🔍 DEBUG chat=${chatUsername} title=${chatTitle} sender=${senderUsername} senderId=${senderId} msgId=${message.id} isEdited=${!!message.editDate} editDate=${message.editDate || "N/A"}`);
 
     // A. Source Channel Check
     const isSourceChat =
