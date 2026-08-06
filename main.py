@@ -23,7 +23,7 @@ API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 SOURCE_CHAT = "@sxhckfufig"
-CHATGPT_BOT = "@chatgpt"  # ChatGPT bot account username
+CHATGPT_BOT = "@chatgpt"  # AI Bot username
 
 FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com"
 
@@ -40,32 +40,39 @@ def process_reply_and_push_to_firebase(reply_text):
     if not reply_text:
         return
 
-    # 1. Content Type पहचानना
-    if "@notes" in reply_text:
+    reply_clean = reply_text.strip().lower()
+
+    # 🛑 1. AI की प्रोसेसिंग/सोचने वाली स्टेटस को रिजेक्ट करें
+    ignore_list = ["सोच...", "thinking...", "please wait...", "generating..."]
+    if any(ig in reply_clean for ig in ignore_list):
+        log.info("⏳ AI अभी सोच रहा है, फाइनल उत्तर का इंतज़ार किया जा रहा है...")
+        return
+
+    # 2. Content Type पहचानना
+    if "@notes" in reply_clean:
         content_type = "@notes"
-    elif "@dpp" in reply_text:
+    elif "@dpp" in reply_clean:
         content_type = "@dpp"
-    elif "@other" in reply_text:
+    elif "@other" in reply_clean:
         content_type = "@other"
     else:
-        content_type = "video"  # अगर तीनों में से कुछ न मिले तो Video माना जाएगा
+        content_type = "video"  # अगर तीनों में से कुछ न मिले तो Video
 
-    # 2. Lecture Number निकालना
+    # 3. Lecture Number निकालना
     lec_match = re.search(r'(@Lec\s*\d+|@L\d+|Lec\s*\d+)', reply_text, re.IGNORECASE)
     lec_tag = lec_match.group(1) if lec_match else ""
 
-    # 3. Chapter Name निकालना (@ से शुरू होने वाला नाम जो type/lec न हो)
+    # 4. Chapter Name निकालना (@ से शुरू होने वाला नाम)
     tags = re.findall(r'@\w+', reply_text)
     chapter_name = "Uncategorized"
     
     for tag in tags:
         tag_lower = tag.lower()
         if tag_lower not in ["@notes", "@dpp", "@other"] and not tag_lower.startswith("@lec"):
-            # Firebase Key बनने योग्य साफ़ नाम (Special characters हटाकर)
             chapter_name = tag.replace("@", "").strip()
             break
 
-    # 4. Firebase में Save करने के लिए Data Payload
+    # 5. Firebase में Save करने के लिए Data Payload
     data_payload = {
         "content_type": content_type,
         "lecture_no": lec_tag,
@@ -73,13 +80,12 @@ def process_reply_and_push_to_firebase(reply_text):
         "timestamp": {".sv": "timestamp"}
     }
 
-    # Firebase REST Endpoint: base_url / Chapter_Name .json
     firebase_url = f"{FIREBASE_BASE_URL}/{chapter_name}.json"
 
     try:
         res = requests.post(firebase_url, json=data_payload)
         if res.status_code == 200:
-            log.info(f"🔥 Firebase me Chapter '{chapter_name}' ke andar data push ho gaya!")
+            log.info(f"🔥 Firebase me Chapter '{chapter_name}' ke andar FINAL data push ho gaya!")
         else:
             log.error(f"❌ Firebase Push Error: {res.status_code} - {res.text}")
     except Exception as e:
@@ -90,7 +96,7 @@ def process_reply_and_push_to_firebase(reply_text):
 # 4. EVENT HANDLERS
 # -------------------------------------------------------------
 
-# Step A: Source Channel se Message aane par ChatGPT ko Forward karna
+# Step A: Source Channel से मैसेज AI बॉट को भेजना
 @client.on(events.NewMessage(chats=SOURCE_CHAT))
 async def forward_to_chatgpt(event):
     try:
@@ -101,11 +107,12 @@ async def forward_to_chatgpt(event):
         log.error(f"❌ Forwarding Error: {e}")
 
 
-# Step B: ChatGPT Bot se Reply Aane par use Parse karke Firebase me bhejna
+# Step B: AI का नया मैसेज या एडिटेड मैसेज पकड़ना
 @client.on(events.NewMessage(chats=CHATGPT_BOT))
+@client.on(events.MessageEdited(chats=CHATGPT_BOT))
 async def handle_chatgpt_reply(event):
     try:
-        log.info(f"[+] ChatGPT se reply mila: {event.text}")
+        log.info(f"[+] AI Response: {event.text}")
         process_reply_and_push_to_firebase(event.text)
     except Exception as e:
         log.error(f"❌ Processing Error: {e}")
