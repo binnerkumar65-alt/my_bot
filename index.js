@@ -8,7 +8,7 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage } = require("telegram/events");
+const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 
@@ -30,20 +30,18 @@ if (!apiId || !apiHash) {
   process.exit(1);
 }
 
-// GramJS Telegram Client Initialization
 const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
 let pendingMedia = {};
 
-// Root Status Check
 app.get("/", (req, res) => {
   res.send("Node.js Fast Streaming & Forwarder Bot is Active!");
 });
 
 // -------------------------------------------------------------
-// 1. FAST STREAMING & DOWNLOAD ROUTE
+// 1. STREAMING & DOWNLOAD ROUTE (FIXED)
 // -------------------------------------------------------------
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -58,12 +56,10 @@ app.get("/stream/:msgId", async (req, res) => {
     const message = messages[0];
     const media = message.media;
     let mimeType = "video/mp4";
-    let fileSize = 0;
-    let fileName = `file_${msgId}`;
+    let fileName = `file_${msgId}.mp4`;
 
     if (media.document) {
       mimeType = media.document.mimeType || "video/mp4";
-      fileSize = media.document.size ? Number(media.document.size) : 0;
       if (media.document.attributes) {
         for (const attr of media.document.attributes) {
           if (attr.fileName) fileName = attr.fileName;
@@ -71,45 +67,17 @@ app.get("/stream/:msgId", async (req, res) => {
       }
     }
 
-    // PDF or Document Handling
-    if (mimeType.includes("pdf") || mimeType.includes("document")) {
-      res.setHeader("Content-Type", mimeType);
-      res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-      const buffer = await client.downloadMedia(message);
-      return res.send(buffer);
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+
+    // Complete Buffer Streaming
+    const buffer = await client.downloadMedia(message);
+    if (!buffer) {
+      return res.status(500).send("Unable to download media from Telegram");
     }
 
-    // Video Streaming Range Handling
-    const range = req.headers.range;
-    let start = 0;
-    let end = fileSize ? fileSize - 1 : 0;
+    return res.send(buffer);
 
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      start = parseInt(parts[0], 10);
-      end = parts[1] ? parseInt(parts[1], 10) : end;
-    }
-
-    const chunkSize = end - start + 1;
-
-    res.writeHead(range ? 206 : 200, {
-      "Content-Range": fileSize ? `bytes ${start}-${end}/${fileSize}` : undefined,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunkSize,
-      "Content-Type": mimeType,
-      "Content-Disposition": `inline; filename="${fileName}"`,
-    });
-
-    const stream = client.iterDownload({
-      file: media,
-      offset: start,
-      requestSize: 512 * 1024,
-    });
-
-    for await (const chunk of stream) {
-      res.write(chunk);
-    }
-    res.end();
   } catch (err) {
     console.error("❌ Stream Route Error:", err);
     if (!res.headersSent) {
@@ -119,33 +87,29 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// 2. FIREBASE PUSH LOGIC (ACCORDING TO CHATGPT RULES)
+// 2. FIREBASE PUSH LOGIC
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return;
-
-  console.log(`📩 ChatGPT Response Received: "${replyText}"`);
 
   const replyClean = replyText.trim().toLowerCase();
   const ignoreList = ["सोच...", "thinking...", "please wait...", "generating..."];
 
   if (ignoreList.some((ig) => replyClean.includes(ig))) {
-    console.log("⏳ AI जवाब तैयार कर रहा है...");
+    console.log("⏳ AI अभी भी जवाब तैयार कर रहा है (सोच... state), इग्नोर कर रहे हैं।");
     return;
   }
 
-  // Content Type Check (@dpp, @notes, or @other)
+  console.log(`📩 ChatGPT का असली जवाब मिला: "${replyText}"`);
+
   let contentType = "@other";
   if (replyClean.includes("@dpp")) contentType = "@dpp";
   else if (replyClean.includes("@notes")) contentType = "@notes";
 
-  // Lecture Tag Extraction (@Lec XX)
   const lecMatch = replyText.match(/@Lec\s*\d+/i);
   const lecTag = lecMatch ? lecMatch[0] : "";
 
-  // Extract all tags including Unicode/Hindi
   const rawTags = replyText.match(/@[^\s@]+/g) || [];
-  
   const systemTags = ["@dpp", "@notes", "@other"];
   const validTags = [];
 
@@ -159,7 +123,6 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   let subjectName = validTags[0] || "General";
   let chapterName = validTags[1] || "General_Lectures";
 
-  // Firebase Keys Cleanup
   const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
   const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
 
@@ -184,9 +147,9 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   try {
     const res = await axios.post(firebaseUrl, dataPayload);
     if (res.status === 200 || res.status === 201) {
-      console.log(`🔥 SUCCESS: Firebase में डेटा सेव हुआ! Path: ${subjectKey} ➔ ${chapterKey}`);
+      console.log(`🔥 SUCCESS! Firebase में डेटा पुश हो गया: ${subjectKey} ➔ ${chapterKey}`);
     } else {
-      console.error(`❌ Firebase Error Status: ${res.status}`);
+      console.error(`❌ Firebase Status: ${res.status}`);
     }
   } catch (err) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
@@ -194,70 +157,74 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 }
 
 // -------------------------------------------------------------
-// 3. MAIN RUNNER & TELEGRAM EVENT LISTENER
+// 3. EVENT HANDLER FOR NEW AND EDITED MESSAGES
 // -------------------------------------------------------------
+async function handleIncomingMessage(event) {
+  try {
+    const message = event.message;
+    if (!message) return;
+
+    const chat = await message.getChat();
+    const sender = await message.getSender();
+
+    const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
+    const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
+    const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
+
+    // Channel Message Check
+    const isSourceChat = 
+      chatUsername === "sxhckfufig" || 
+      chatTitle.includes("sxhckfufig");
+
+    if (isSourceChat) {
+      console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
+      
+      let streamLink = "";
+      if (message.media) {
+        streamLink = `${RENDER_URL}/stream/${message.id}`;
+        console.log(`🔗 Stream Link Banna: ${streamLink}`);
+      }
+
+      pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
+
+      const chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      const msgText = message.text || "Media File";
+      
+      await client.sendMessage(chatgptEntity, { message: msgText });
+      console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
+      return;
+    }
+
+    // ChatGPT Reply Check (New or Edited)
+    const isChatGPT = 
+      chatUsername.includes("chatgpt") || 
+      chatTitle.includes("chatgpt") ||
+      senderUsername.includes("chatgpt") ||
+      CHATGPT_BOT.toLowerCase().includes(senderUsername);
+
+    if (isChatGPT) {
+      console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${message.text}"`);
+      const mediaInfo = pendingMedia["latest"] || {};
+      await processReplyAndPushToFirebase(message.text, mediaInfo);
+    }
+
+  } catch (err) {
+    console.error("❌ Event Handler Error:", err);
+  }
+}
+
 async function startServer() {
   await client.connect();
   console.log("✅ Telegram Client Connected!");
 
-  client.addEventHandler(async (event) => {
-    try {
-      const message = event.message;
-      if (!message) return;
-
-      const chat = await message.getChat();
-      const sender = await message.getSender();
-
-      const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
-      const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
-      const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
-
-      // 1. Check Channel Message (@sxhckfufig)
-      const isSourceChat = 
-        chatUsername === "sxhckfufig" || 
-        chatTitle.includes("sxhckfufig");
-
-      if (isSourceChat) {
-        console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
-        
-        let streamLink = "";
-        if (message.media) {
-          streamLink = `${RENDER_URL}/stream/${message.id}`;
-          console.log(`🔗 Stream Link Banna: ${streamLink}`);
-        }
-
-        pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
-
-        const chatgptEntity = await client.getEntity(CHATGPT_BOT);
-        const msgText = message.text || "Media File";
-        
-        await client.sendMessage(chatgptEntity, { message: msgText });
-        console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
-        return;
-      }
-
-      // 2. Check ChatGPT Reply
-      const isChatGPT = 
-        chatUsername.includes("chatgpt") || 
-        chatTitle.includes("chatgpt") ||
-        senderUsername.includes("chatgpt") ||
-        CHATGPT_BOT.toLowerCase().includes(senderUsername);
-
-      if (isChatGPT) {
-        console.log(`\n🤖 [STEP 3] ChatGPT Response Aaya: "${message.text}"`);
-        const mediaInfo = pendingMedia["latest"] || {};
-        
-        console.log("🚀 [STEP 4] Firebase Push Function Trigger Ho Raha Hai...");
-        await processReplyAndPushToFirebase(message.text, mediaInfo);
-      }
-
-    } catch (err) {
-      console.error("❌ Event Handler Error:", err);
-    }
-  }, new NewMessage({}));
+  // Listen for NEW messages
+  client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+  
+  // Listen for EDITED messages (Crucial for ChatGPT 'सोच...' updates)
+  client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
 
   app.listen(PORT, () => {
-    console.log(`🚀 Node.js Streaming Proxy Running on Port ${PORT}`);
+    console.log(`🚀 Node.js Proxy Running on Port ${PORT}`);
   });
 }
 
