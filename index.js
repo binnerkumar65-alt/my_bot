@@ -114,7 +114,7 @@ app.get("/stream/:msgId", async (req, res) => {
 function cleanChapterName(rawName) {
   if (!rawName) return "Uncategorized";
   let name = rawName.replace(/@/g, "").trim();
-  name = name.replace(/(?i)\b(lec|lecture|part|dpp|notes|class)\b.*/gi, "");
+  name = name.replace(/\b(lec|lecture|part|dpp|notes|class)\b.*/gi, "");
   name = name.replace(/[\d\-_\:()\[\]]+$/g, "").trim();
   return name || "Uncategorized";
 }
