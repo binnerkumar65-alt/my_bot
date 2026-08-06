@@ -155,27 +155,34 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
   }
 }
-
 // -------------------------------------------------------------
-// 3. EVENT HANDLERS
+// 3. EVENT HANDLERS (EDITED MESSAGE FIXED)
 // -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
+    // 1. मैसेज टेक्स्ट निकालें (चाहे नया संदेश हो या Edit हुआ हो)
     const message = event.message;
     if (!message) return;
+
+    // GramJS में edited message का टेक्स्ट message.message या message.text में होता है
+    const currentText = message.text || message.message || "";
 
     const chat = await message.getChat();
     const sender = await message.getSender();
 
     const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
     const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
-    const senderUsername = (sender && sender.username ? sender.senderUsername || sender.username : "").toLowerCase();
+    const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
 
+    // A. Source Channel Check
     const isSourceChat = 
       chatUsername === "sxhckfufig" || 
       chatTitle.includes("sxhckfufig");
 
     if (isSourceChat) {
+      // चैनल के सिर्फ नए मैसेज पर एक्शन लें
+      if (event.isEdit) return; // अगर चैनल का खुद का मैसेज एडिट हुआ तो इग्नोर करें
+
       console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
       
       let streamLink = "";
@@ -187,13 +194,14 @@ async function handleIncomingMessage(event) {
       pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
 
       const chatgptEntity = await client.getEntity(CHATGPT_BOT);
-      const msgText = message.text || "Media File";
+      const msgText = currentText || "Media File";
       
       await client.sendMessage(chatgptEntity, { message: msgText });
       console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
       return;
     }
 
+    // B. ChatGPT Response Check
     const isChatGPT = 
       chatUsername.includes("chatgpt") || 
       chatTitle.includes("chatgpt") ||
@@ -201,9 +209,13 @@ async function handleIncomingMessage(event) {
       CHATGPT_BOT.toLowerCase().includes(senderUsername);
 
     if (isChatGPT) {
-      console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${message.text}"`);
+      console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua (IsEdit: ${!!event.isEdit}): "${currentText}"`);
+      
       const mediaInfo = pendingMedia["latest"] || {};
-      await processReplyAndPushToFirebase(message.text, mediaInfo);
+      
+      // यह फ़ंक्शन खुद चेक करेगा कि अगर "सोच..." है तो इग्नोर करे, 
+      // और जब एडिट होकर असली जवाब आए तो फ़ायरबेस में भेज दे।
+      await processReplyAndPushToFirebase(currentText, mediaInfo);
     }
 
   } catch (err) {
@@ -211,33 +223,3 @@ async function handleIncomingMessage(event) {
   }
 }
 
-// -------------------------------------------------------------
-// 4. SERVER STARTUP
-// -------------------------------------------------------------
-async function startServer() {
-  // 1. Port open for Render
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
-  });
-
-  // 2. Connect Telegram Client
-  try {
-    await client.connect();
-    console.log("✅ Telegram Client Connected!");
-
-    // GramJS Events safely attached
-    client.addEventHandler(handleIncomingMessage, new events.NewMessage({}));
-    
-    if (events.EditedMessage) {
-      client.addEventHandler(handleIncomingMessage, new events.EditedMessage({}));
-    } else {
-      client.addEventHandler(handleIncomingMessage, new events.NewMessage({ func: (e) => e.isEdited }));
-    }
-
-    console.log("🤖 Event Handlers Successfully Registered!");
-  } catch (err) {
-    console.error("❌ Telegram Client Connection Error:", err);
-  }
-}
-
-startServer();
