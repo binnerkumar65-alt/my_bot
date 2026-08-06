@@ -36,12 +36,13 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let pendingMedia = {};
 
+// Root Check
 app.get("/", (req, res) => {
-  res.send("Node.js Fast Streaming & Forwarder Bot is Active!");
+  res.send("Node.js Proxy & Bot is Active!");
 });
 
 // -------------------------------------------------------------
-// 1. STREAMING & DOWNLOAD ROUTE (FIXED)
+// 1. STREAMING & DOWNLOAD ROUTE
 // -------------------------------------------------------------
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -70,7 +71,6 @@ app.get("/stream/:msgId", async (req, res) => {
     res.setHeader("Content-Type", mimeType);
     res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
 
-    // Complete Buffer Streaming
     const buffer = await client.downloadMedia(message);
     if (!buffer) {
       return res.status(500).send("Unable to download media from Telegram");
@@ -96,11 +96,11 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   const ignoreList = ["सोच...", "thinking...", "please wait...", "generating..."];
 
   if (ignoreList.some((ig) => replyClean.includes(ig))) {
-    console.log("⏳ AI अभी भी जवाब तैयार कर रहा है (सोच... state), इग्नोर कर रहे हैं।");
+    console.log("⏳ AI अभी सोच रहा है (सोच... state), स्किप कर रहे हैं।");
     return;
   }
 
-  console.log(`📩 ChatGPT का असली जवाब मिला: "${replyText}"`);
+  console.log(`📩 ChatGPT का असली जवाब: "${replyText}"`);
 
   let contentType = "@other";
   if (replyClean.includes("@dpp")) contentType = "@dpp";
@@ -142,14 +142,14 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   }
 
   const firebaseUrl = `${FIREBASE_BASE_URL}/${subjectKey}/${chapterKey}.json`;
-  console.log(`🚀 Firebase Push Target: ${subjectKey} ➔ ${chapterKey}`);
+  console.log(`🚀 Push target: ${subjectKey} ➔ ${chapterKey}`);
 
   try {
     const res = await axios.post(firebaseUrl, dataPayload);
     if (res.status === 200 || res.status === 201) {
-      console.log(`🔥 SUCCESS! Firebase में डेटा पुश हो गया: ${subjectKey} ➔ ${chapterKey}`);
+      console.log(`🔥 SUCCESS! Firebase में डेटा पुश हो गया! Path: ${subjectKey} ➔ ${chapterKey}`);
     } else {
-      console.error(`❌ Firebase Status: ${res.status}`);
+      console.error(`❌ Firebase Error Status: ${res.status}`);
     }
   } catch (err) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
@@ -157,7 +157,7 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 }
 
 // -------------------------------------------------------------
-// 3. EVENT HANDLER FOR NEW AND EDITED MESSAGES
+// 3. EVENT HANDLERS
 // -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
@@ -171,7 +171,6 @@ async function handleIncomingMessage(event) {
     const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
     const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
 
-    // Channel Message Check
     const isSourceChat = 
       chatUsername === "sxhckfufig" || 
       chatTitle.includes("sxhckfufig");
@@ -195,7 +194,6 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // ChatGPT Reply Check (New or Edited)
     const isChatGPT = 
       chatUsername.includes("chatgpt") || 
       chatTitle.includes("chatgpt") ||
@@ -217,14 +215,11 @@ async function startServer() {
   await client.connect();
   console.log("✅ Telegram Client Connected!");
 
-  // Listen for NEW messages
   client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-  
-  // Listen for EDITED messages (Crucial for ChatGPT 'सोच...' updates)
   client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
 
   app.listen(PORT, () => {
-    console.log(`🚀 Node.js Proxy Running on Port ${PORT}`);
+    console.log(`🚀 Server Running on Port ${PORT}`);
   });
 }
 
