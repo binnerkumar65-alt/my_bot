@@ -10,10 +10,8 @@ from telethon.sessions import StringSession
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# 1. Quart Async App (Flask ka Native Async Version)
 app = Quart(__name__)
 
-# 2. Configuration
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
@@ -36,25 +34,45 @@ async def home():
     return "Stream & Forwarder Bot is Running Perfectly!"
 
 # -------------------------------------------------------------
-# 3. ASYNC PROXY STREAMING ROUTE (Crash-Free Buffer Stream)
+# 3. FIXED PROXY STREAMING & PLAYBACK ROUTE
 # -------------------------------------------------------------
 @app.route('/stream/<int:msg_id>')
 async def stream_file(msg_id):
-    """ Telegram se direct chunks me stream bina disk use kiye """
-    
-    async def generate():
-        try:
-            message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
-            if message and message.media:
+    """ Telegram media ko browser me direct play/view karne ke liye """
+    try:
+        message = await client.get_messages(SOURCE_CHAT, ids=msg_id)
+        if not message or not message.media:
+            return "Media not found", 404
+
+        # File Mime-Type Pehchanna (Video / PDF / Document)
+        mime_type = "video/mp4" # Default for Video
+        file_name = "media_file"
+
+        if hasattr(message.media, 'document'):
+            mime_type = message.media.document.mime_type or "video/mp4"
+            for attr in message.media.document.attributes:
+                if hasattr(attr, 'file_name') and attr.file_name:
+                    file_name = attr.file_name
+
+        async def generate():
+            try:
                 async for chunk in client.download_media(message, file=bytes, chunk_size=1024 * 512):
                     yield chunk
-            else:
-                yield b"Media message not found"
-        except Exception as e:
-            log.error(f"Streaming Exception: {e}")
-            yield f"Error streaming file: {str(e)}".encode()
+            except Exception as e:
+                log.error(f"Streaming Chunk Error: {e}")
 
-    return Response(stream_with_context(generate)(), mimetype='application/octet-stream')
+        # Proper Headers for In-Browser Playback and Streaming
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Disposition": f'inline; filename="{file_name}"',
+            "Accept-Ranges": "bytes"
+        }
+
+        return Response(stream_with_context(generate)(), headers=headers)
+
+    except Exception as e:
+        log.error(f"Streaming Exception: {e}")
+        return f"Error: {str(e)}", 500
 
 
 # -------------------------------------------------------------
@@ -193,7 +211,7 @@ async def main():
         log.error("❌ Session Invalid!")
         return
 
-    log.info("✅ Quart Async Stream Server Ready & Active!")
+    log.info("✅ Direct Media Playback & Stream Engine Active!")
 
     await asyncio.gather(
         hypercorn.asyncio.serve(app, config),
