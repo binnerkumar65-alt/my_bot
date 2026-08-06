@@ -2,19 +2,20 @@ import os
 import asyncio
 import requests
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 
-# Environment Variables से डेटा उठाएगा
-API_ID = int(os.environ.get("30414263"))
-API_HASH = os.environ.get("7ac29590d4ad54e141856dfa4cc04dac")
-SESSION_STRING = os.environ.get("SESSION_STRING")
+# 1. Telegram Credentials (यहाँ अपनी डिटेल्स भरें)
+API_ID = 30414263  # अपना my.telegram.org वाला API ID डालें (बिना Quotes के)
+API_HASH = "7ac29590d4ad54e141856dfa4cc04dac"  # अपना API HASH डालें
 
-# Target Details
+# 2. Target Channels & Bots
 SOURCE_CHANNEL = "sxhckfufig"
 TARGET_BOT = "chatgpt"
+
+# 3. Firebase URL
 FIREBASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com/telegram_data.json"
 
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+# Client Init (यह अपने आप 'my_session.session' फ़ाइल बना लेगा)
+client = TelegramClient('my_session', API_ID, API_HASH)
 
 def push_to_firebase(data):
     try:
@@ -32,24 +33,27 @@ async def handle_new_message(event):
     if not source_text:
         return
 
-    print(f"\n[+] New message received from @{SOURCE_CHANNEL}")
+    print(f"\n[+] New message from @{SOURCE_CHANNEL}")
 
     try:
-        # ChatGPT Bot से बात करना
+        # Step 1: ChatGPT Bot को मैसेज भेजें
         async with client.conversation(TARGET_BOT, timeout=60) as conv:
             await conv.send_message(source_text)
+            
+            # Step 2: ChatGPT Bot के रिप्लाई का इंतज़ार करें
             response = await conv.get_response()
             reply_text = response.text
 
             print(f"[+] Received reply from @{TARGET_BOT}")
 
-            # Firebase Payload
+            # Step 3: Firebase Payload
             payload = {
                 "source_text": source_text,
                 "processed_tags": reply_text,
                 "timestamp": event.message.date.isoformat()
             }
 
+            # Step 4: Firebase में भेजें
             push_to_firebase(payload)
 
     except asyncio.TimeoutError:
@@ -59,7 +63,7 @@ async def handle_new_message(event):
 
 async def main():
     print("[+] Starting Telethon Client...")
-    await client.start()
+    await client.start()  # पहली बार चलाने पर यही आपसे Phone Number + OTP पूछेगा
     print("[+] Client is running & listening for messages...")
     await client.run_until_disconnected()
 
