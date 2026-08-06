@@ -8,7 +8,6 @@ const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const express = require("express");
 const axios = require("axios");
-const re = require("re");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
