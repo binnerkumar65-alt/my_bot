@@ -26,7 +26,7 @@ Thread(target=run_flask, daemon=True).start()
 # -------------------------------------------------------------
 API_ID = int(os.environ.get("API_ID", 30414263))
 API_HASH = os.environ.get("API_HASH", "7ac29590d4ad54e141856dfa4cc04dac")
-SESSION_STRING = os.environ.get("1BVtsOLUBu7NW664h3NBQatAj2edrdpG5Gi8MuFIGoCTBtzNu1HQBuziC3HrOF8YRuo1kt5yD91tVGKETYuALE_gS02KfMNN4R5Mn3xmYvOAH1Muc3S0bsYcYueXEa35-DIKHfM8xQDTXwODRs5PdeKdKwhtH_BhvY0um1lo4_mWeUU8Ew9vGqLJCEvQZtPrxIkLF9RP864uFY8a4dZickEoxXbO9GE-lffbOiv7BXJVYQCWsVloHd__Dw1i5A1Z-qiyOuNgqDKJrFvsAMzWKwLcdVIwWeJrtuAUsnGKmZYwMth4YOEhEhriInlX9x4UJ8_cAPDYH_DeMFtOTj71fJWYZZJE-cbQ=")
+SESSION_STRING = os.environ.get("SESSION_STRING")
 
 # यहाँ अपने सोर्स और टारगेट चैनल के यूज़रनेम / ID डालें
 SOURCE_CHAT = "@sxhckfufig"      # जहाँ से मैसेज पढ़ना है
