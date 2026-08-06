@@ -8,13 +8,11 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage, EditedMessage } = require("telegram/events");
+const events = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
-
-// Render स्वतः ही PORT पर्यावरण चर (Environment Variable) प्रदान करता है
 const PORT = process.env.PORT || 10000;
 
 // Environment Variables Configuration
@@ -38,7 +36,7 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let pendingMedia = {};
 
-// Root Check for Render Port Health Check
+// Root Check for Render Health Check
 app.get("/", (req, res) => {
   res.send("Node.js Proxy & Bot is Active!");
 });
@@ -171,7 +169,7 @@ async function handleIncomingMessage(event) {
 
     const chatUsername = (chat && chat.username ? chat.username : "").toLowerCase();
     const chatTitle = (chat && chat.title ? chat.title : "").toLowerCase();
-    const senderUsername = (sender && sender.username ? sender.username : "").toLowerCase();
+    const senderUsername = (sender && sender.username ? sender.senderUsername || sender.username : "").toLowerCase();
 
     const isSourceChat = 
       chatUsername === "sxhckfufig" || 
@@ -214,21 +212,29 @@ async function handleIncomingMessage(event) {
 }
 
 // -------------------------------------------------------------
-// 4. SERVER STARTUP (Render Binding Fix Included)
+// 4. SERVER STARTUP
 // -------------------------------------------------------------
 async function startServer() {
-  // पहले वेब सर्वर चालू करें ताकि Render पोर्ट डिटेक्ट करके Live कर दे
+  // 1. Port open for Render
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
   });
 
-  // फिर टेलीग्राम क्लाइंट से कनेक्ट करें
+  // 2. Connect Telegram Client
   try {
     await client.connect();
     console.log("✅ Telegram Client Connected!");
 
-    client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
+    // GramJS Events safely attached
+    client.addEventHandler(handleIncomingMessage, new events.NewMessage({}));
+    
+    if (events.EditedMessage) {
+      client.addEventHandler(handleIncomingMessage, new events.EditedMessage({}));
+    } else {
+      client.addEventHandler(handleIncomingMessage, new events.NewMessage({ func: (e) => e.isEdited }));
+    }
+
+    console.log("🤖 Event Handlers Successfully Registered!");
   } catch (err) {
     console.error("❌ Telegram Client Connection Error:", err);
   }
