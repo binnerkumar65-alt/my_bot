@@ -1,67 +1,68 @@
 import os
 import asyncio
+import logging
 from flask import Flask
-from threading import Thread
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-# -------------------------------------------------------------
-# 1. FLASK SERVER (Render Uptime Keep-Alive)
-# -------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# 1. Flask App
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is Alive and Running!"
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+# 2. Configuration (Render के Environment Variables से खुद-ब-खुद उठेंगे)
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
-# Background में Flask चलाएं
-Thread(target=run_flask, daemon=True).start()
+# --------------------------------------------------------------------------
+# 👇 केवल इन 2 लाइनों को बदलना है:
+SOURCE_CHAT = "@sxhckfufig"         # जहाँ से मैसेज उठाना है
+TARGET_CHAT = "@ApneTargetChannel"  # 👈 यहाँ अपने असली चैनल का Username या ID डालें
+# --------------------------------------------------------------------------
 
-# -------------------------------------------------------------
-# 2. CONFIGURATION
-# -------------------------------------------------------------
-API_ID = int(os.environ.get("API_ID", 30414263))
-API_HASH = os.environ.get("API_HASH", "7ac29590d4ad54e141856dfa4cc04dac")
-SESSION_STRING = os.environ.get("SESSION_STRING")
-
-# यहाँ अपने सोर्स और टारगेट चैनल के यूज़रनेम / ID डालें
-SOURCE_CHAT = "@sxhckfufig"      # जहाँ से मैसेज पढ़ना है
-TARGET_CHAT = "@your_target_chat" # जहाँ मैसेज भेजना है (बदल लें)
-
-if not SESSION_STRING:
-    print("❌ SESSION_STRING नहीं मिला!")
-    exit(1)
+if not API_ID or not API_HASH or not SESSION_STRING:
+    raise RuntimeError("API_ID, API_HASH, ya SESSION_STRING env vars missing hain! Ye set karo deployment settings me.")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# -------------------------------------------------------------
-# 3. MESSAGE FORWARDING EVENT HANDLER
-# -------------------------------------------------------------
+# 3. Forward Event
 @client.on(events.NewMessage(chats=SOURCE_CHAT))
 async def forward_handler(event):
     try:
-        print(f"[+] नया मैसेज मिला: {event.text}")
-        
-        # मैसेज फॉरवर्ड/कॉपी करना
+        log.info(f"[+] Naya message mila: {event.text}")
         if event.text:
             await client.send_message(TARGET_CHAT, event.text)
-            print("✅ टेक्स्ट मैसेज सफलतापूर्वक फॉरवर्ड हो गया!")
-            
+            log.info("✅ Message forward ho gaya!")
     except Exception as e:
-        print(f"❌ Forward Error: {e}")
+        log.error(f"❌ Error: {e}")
 
-# -------------------------------------------------------------
-# 4. MAIN ASYNC RUNNER
-# -------------------------------------------------------------
+# 4. Main Runner
 async def main():
-    print("[+] Telethon Client कनेक्ट हो रहा है...")
+    import hypercorn.asyncio
+    from hypercorn.config import Config
+
+    config = Config()
+    config.bind = [f"0.0.0.0:{os.environ.get('PORT', 10000)}"]
+
+    log.info("[+] Telethon client connect ho raha hai...")
     await client.connect()
-    print("✅ Telethon सफलतापूर्वक लॉगिन हो गया है! मैसेज सुनने के लिए तैयार...")
-    await client.run_until_disconnected()
+
+    if not await client.is_user_authorized():
+        log.error("❌ Session invalid ya login nahi hua! SESSION_STRING check karo.")
+        return
+
+    log.info("✅ Login successful! Messages sunne ke liye taiyar...")
+
+    await asyncio.gather(
+        hypercorn.asyncio.serve(app, config),
+        client.run_until_disconnected()
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
