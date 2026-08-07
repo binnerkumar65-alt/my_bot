@@ -139,6 +139,27 @@ async function preWarmStream(msgId) {
   }
 }
 
+// Jab caption khaali chhod di jaaye (sirf file forward ki gayi ho), to file
+// ke apne naam se hi ek usable text bana lo - taaki ChatGPT ko kम se kम
+// kuch to milta rahe tagging ke liye, "Media File" jaisa khaali text nahi.
+// e.g. "समतल_में_गति_08_Concise_notes_XYZ.pdf" -> "समतल में गति 08 Concise notes XYZ"
+function extractFileNameText(message) {
+  try {
+    if (message.media && message.media.document && message.media.document.attributes) {
+      for (const attr of message.media.document.attributes) {
+        if (attr.fileName) {
+          return attr.fileName
+            .replace(/\.[a-zA-Z0-9]{2,5}$/, "")   // extension hatao
+            .replace(/[_\-]+/g, " ")              // underscores/dashes -> space
+            .replace(/\s{2,}/g, " ")
+            .trim();
+        }
+      }
+    }
+  } catch (e) { /* ignore - fallback string will be used instead */ }
+  return "";
+}
+
 // Root Check for Render Health Check
 app.get("/", (req, res) => {
   res.send("Node.js Proxy & Bot is Active!");
@@ -398,7 +419,10 @@ async function handleIncomingMessage(event) {
         preWarmStream(message.id); // fire-and-forget, don't block the queue on this
       }
 
-      const msgText = currentText || "Media File";
+      const msgText = currentText || extractFileNameText(message) || "Media File";
+      if (!currentText) {
+        console.log(`📎 Caption khaali thi - istemal kiya gaya text: "${msgText}"`);
+      }
 
       // Har message ab QUEUE mein jaata hai - ek time pe sirf ek hi
       // ChatGPT ke paas jaata hai, taaki Notes/DPP/lecture ek saath
