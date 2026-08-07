@@ -25,6 +25,7 @@ const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
 
 if (!apiId || !apiHash) {
   console.error("❌ API_ID या API_HASH missing हैं!");
@@ -37,6 +38,9 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 // Resolved once at startup - used for reliable ChatGPT bot detection
 let chatgptBotId = null;
+// Cached ChatGPT bot entity object - resolved once at startup, reused by
+// the queue so every queued item doesn't need its own Telegram lookup.
+let chatgptEntity = null;
 // Resolved once at startup - used for reliable source-channel detection
 let sourceChatId = null;
 // Cached entity object (not just the ID) - reused by /stream so every
@@ -65,7 +69,10 @@ function enqueueSourceMessage(item) {
   messageQueue.push(item);
   console.log(`📥 [QUEUE] Add hua ID=${item.msgId} | queue length ab: ${messageQueue.length}`);
   if (!isProcessingQueue) {
-    processQueue();
+    processQueue().catch((e) => {
+      console.error("❌ [QUEUE] processQueue crash hua:", e);
+      isProcessingQueue = false; // safety - don't let the queue get stuck forever
+    });
   }
 }
 
@@ -101,7 +108,9 @@ async function processQueue() {
     console.log(`\n➡️ [QUEUE] Process ho raha hai ID=${item.msgId} | baaki bache queue mein: ${messageQueue.length}`);
 
     try {
-      const chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      if (!chatgptEntity) {
+        chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      }
       await client.sendMessage(chatgptEntity, { message: item.text });
       console.log("📨 [QUEUE] ChatGPT ko bhej diya, ab sirf ISI item ke asli jawab ka wait kar rahe hain...");
 
@@ -118,6 +127,51 @@ async function processQueue() {
   }
 
   isProcessingQueue = false;
+}
+
+// -------------------------------------------------------------
+// THUMBNAIL (ImgBB) - Telegram videos already carry a small embedded
+// preview JPEG (the thumbnail the sending client generated), so we don't
+// need to download/decode the actual video to get a thumbnail. We grab
+// just that small thumb and host it on ImgBB, so the HTML can show it as
+// an instant <img> the moment the page loads - no video buffering wait.
+// -------------------------------------------------------------
+const thumbPromises = new Map(); // msgId -> Promise<string|null>
+
+function startThumbUpload(message) {
+  if (!IMGBB_API_KEY) {
+    console.log("⚠️ [THUMB] IMGBB_API_KEY set nahi hai - thumbnail upload skip.");
+    return;
+  }
+  const msgId = message.id;
+  const promise = (async () => {
+    try {
+      const thumbBuffer = await client.downloadMedia(message, { thumb: -1 });
+      if (!thumbBuffer) return null;
+
+      const params = new URLSearchParams();
+      params.append("key", IMGBB_API_KEY);
+      params.append("image", thumbBuffer.toString("base64"));
+
+      const res = await axios.post("https://api.imgbb.com/1/upload", params);
+      const url = res.data && res.data.data && res.data.data.url;
+      if (url) {
+        console.log(`🖼️ [THUMB] ImgBB upload OK msgId=${msgId}: ${url}`);
+      } else {
+        console.error(`❌ [THUMB] ImgBB response mein URL nahi mila, msgId=${msgId}`);
+      }
+      return url || null;
+    } catch (e) {
+      console.error(`❌ [THUMB] Upload fail hui msgId=${msgId}:`, e.response ? e.response.data : e.message);
+      return null;
+    } finally {
+      // Safety cleanup - agar ye thumb kabhi consume nahi hua (e.g. notes/dpp
+      // message jiske liye thumb ki zaroorat hi nahi thi), map mein hamesha
+      // ke liye na pada rahe.
+      setTimeout(() => thumbPromises.delete(msgId), 5 * 60 * 1000);
+    }
+  })();
+  thumbPromises.set(msgId, promise);
 }
 
 // Fire-and-forget pre-warm: resolve the source message ahead of time so
@@ -346,6 +400,19 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
       dataPayload["download_link"] = mediaInfo.stream_link;
     } else {
       dataPayload["stream_link"] = mediaInfo.stream_link;
+
+      // Thumb upload started the moment the message arrived, in parallel
+      // with the ChatGPT round-trip above - so by now it has almost always
+      // already finished. Wait a little just in case, but never block the
+      // Firebase push for long.
+      if (mediaInfo.msg_id && thumbPromises.has(mediaInfo.msg_id)) {
+        const thumbUrl = await Promise.race([
+          thumbPromises.get(mediaInfo.msg_id),
+          new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+        ]);
+        if (thumbUrl) dataPayload["thumb_link"] = thumbUrl;
+        thumbPromises.delete(mediaInfo.msg_id);
+      }
     }
   }
 
@@ -417,6 +484,7 @@ async function handleIncomingMessage(event) {
         streamLink = `${RENDER_URL}/stream/${message.id}`;
         console.log(`🔗 Stream Link Banna: ${streamLink}`);
         preWarmStream(message.id); // fire-and-forget, don't block the queue on this
+        startThumbUpload(message); // fire-and-forget - runs in parallel with the ChatGPT round-trip below
       }
 
       const msgText = currentText || extractFileNameText(message) || "Media File";
@@ -470,10 +538,10 @@ async function startServer() {
     await client.connect();
     console.log("✅ Telegram Client Connected!");
 
-    // Resolve the ChatGPT bot's numeric ID once - used for reliable matching
+    // Resolve the ChatGPT bot's numeric ID (and cache the full entity) once
     try {
-      const botEntity = await client.getEntity(CHATGPT_BOT);
-      chatgptBotId = botEntity.id.toString();
+      chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      chatgptBotId = chatgptEntity.id.toString();
       console.log("🤖 ChatGPT Bot ID resolved:", chatgptBotId);
     } catch (e) {
       console.error("❌ ChatGPT Bot ID resolve nahi hua:", e.message);
