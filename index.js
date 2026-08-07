@@ -297,10 +297,26 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
   const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
 
+  // ChatGPT ka reply sirf tags hota hai ("@Chemistry @साम्यावस्था @other
+  // @Lec 08") - koi asli title/description text nahi hota. Isliye raw_reply
+  // se @tags hata kar title banane ki koshish karne se sirf bacha-khucha
+  // number ("08") milta tha. Ab tags se hi ek saaf, padhne-laayak title
+  // seedha bana rahe hain.
+  const lecNum = lecTag.replace(/^@?lec\s*/i, "").trim();
+  let displayTitle;
+  if (contentType === "@notes") {
+    displayTitle = `${chapterName} — Notes${lecNum ? " (" + lecNum + ")" : ""}`;
+  } else if (contentType === "@dpp") {
+    displayTitle = `${chapterName} — DPP${lecNum ? " (" + lecNum + ")" : ""}`;
+  } else {
+    displayTitle = `${chapterName}${lecNum ? " — Lecture " + lecNum : ""}`;
+  }
+
   const dataPayload = {
     content_type: contentType,
     lecture_no: lecTag,
     raw_reply: replyText,
+    display_title: displayTitle,
     timestamp: { ".sv": "timestamp" },
   };
 
