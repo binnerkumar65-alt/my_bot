@@ -35,12 +35,109 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
-let pendingMedia = {};
-
 // Resolved once at startup - used for reliable ChatGPT bot detection
 let chatgptBotId = null;
 // Resolved once at startup - used for reliable source-channel detection
 let sourceChatId = null;
+// Cached entity object (not just the ID) - reused by /stream so every
+// request doesn't re-fetch it from Telegram, which was adding latency
+// on every single click.
+let sourceEntity = null;
+
+// Small in-memory cache of message objects, keyed by msgId. Populated
+// right after a message arrives (pre-warm), so by the time the HTML
+// requests /stream/:msgId, the Telegram lookup is already done and the
+// response starts immediately instead of waiting on a fresh getMessages call.
+const messageCache = new Map();
+
+// -------------------------------------------------------------
+// SEQUENTIAL QUEUE - fixes Notes/DPP (or any batch of forwards)
+// getting mixed up when several messages are forwarded together.
+// Only ONE message is in-flight with ChatGPT at a time; the next one
+// is sent only after the current one's real (non-"सोच...") reply lands.
+// -------------------------------------------------------------
+const messageQueue = [];
+let isProcessingQueue = false;
+let currentMediaInfo = null;   // media info for whichever item is in-flight right now
+let resolveCurrentReply = null; // resolves once the real ChatGPT answer for the in-flight item arrives
+
+function enqueueSourceMessage(item) {
+  messageQueue.push(item);
+  console.log(`📥 [QUEUE] Add hua ID=${item.msgId} | queue length ab: ${messageQueue.length}`);
+  if (!isProcessingQueue) {
+    processQueue();
+  }
+}
+
+function waitForChatGPTReply(timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        console.log("⏱️ [QUEUE] Timeout - is item ka reply nahi mila, queue ko rok nahi sakte, agle item pe badh rahe hain");
+        resolve();
+      }
+    }, timeoutMs);
+
+    resolveCurrentReply = () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+  });
+}
+
+async function processQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+
+  while (messageQueue.length > 0) {
+    const item = messageQueue.shift();
+    currentMediaInfo = { stream_link: item.streamLink, msg_id: item.msgId };
+
+    console.log(`\n➡️ [QUEUE] Process ho raha hai ID=${item.msgId} | baaki bache queue mein: ${messageQueue.length}`);
+
+    try {
+      const chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      await client.sendMessage(chatgptEntity, { message: item.text });
+      console.log("📨 [QUEUE] ChatGPT ko bhej diya, ab sirf ISI item ke asli jawab ka wait kar rahe hain...");
+
+      // Wait for the real (non-thinking) reply before moving to the next
+      // queued item - this is what keeps Notes/DPP/lecture links from
+      // ever getting attached to the wrong message.
+      await waitForChatGPTReply(60000);
+    } catch (e) {
+      console.error("❌ [QUEUE] Processing error:", e.message);
+    }
+
+    resolveCurrentReply = null;
+    currentMediaInfo = null;
+  }
+
+  isProcessingQueue = false;
+}
+
+// Fire-and-forget pre-warm: resolve the source message ahead of time so
+// the /stream route below doesn't have to do a fresh Telegram lookup on
+// the person's first click - combined with the HTML's own preload, this
+// is what makes playback start instantly instead of buffering.
+async function preWarmStream(msgId) {
+  try {
+    if (!sourceEntity) {
+      sourceEntity = await client.getEntity(SOURCE_CHAT);
+    }
+    const messages = await client.getMessages(sourceEntity, { ids: msgId });
+    if (messages && messages.length && messages[0].media) {
+      messageCache.set(msgId, messages[0]);
+      console.log(`🔥 [PRE-WARM] Message ID=${msgId} cache mein ready.`);
+    }
+  } catch (e) {
+    console.error("❌ [PRE-WARM] Error:", e.message);
+  }
+}
 
 // Root Check for Render Health Check
 app.get("/", (req, res) => {
@@ -53,14 +150,27 @@ app.get("/", (req, res) => {
 app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
-    const entity = await client.getEntity(SOURCE_CHAT);
-    const messages = await client.getMessages(entity, { ids: msgId });
 
-    if (!messages || messages.length === 0 || !messages[0].media) {
+    // Use the pre-warmed cache when available - this is what makes repeat
+    // requests (like the HTML's background preload, then the real click)
+    // skip the Telegram round-trip entirely.
+    let message = messageCache.get(msgId);
+    if (!message) {
+      if (!sourceEntity) {
+        sourceEntity = await client.getEntity(SOURCE_CHAT);
+      }
+      const messages = await client.getMessages(sourceEntity, { ids: msgId });
+      if (!messages || messages.length === 0 || !messages[0].media) {
+        return res.status(404).send("Media not found");
+      }
+      message = messages[0];
+      messageCache.set(msgId, message);
+    }
+
+    if (!message.media) {
       return res.status(404).send("Media not found");
     }
 
-    const message = messages[0];
     const media = message.media;
     let mimeType = "video/mp4";
     let fileName = `file_${msgId}.mp4`;
@@ -135,14 +245,14 @@ app.get("/stream/:msgId", async (req, res) => {
 // 2. FIREBASE PUSH LOGIC
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
-  if (!replyText) return;
+  if (!replyText) return false;
 
   const replyClean = replyText.trim().toLowerCase();
   const ignoreList = ["सोच...", "thinking...", "please wait...", "generating..."];
 
   if (ignoreList.some((ig) => replyClean.includes(ig))) {
     console.log("⏳ AI अभी सोच रहा है (सोच... state), स्किप कर रहे हैं।");
-    return;
+    return false;
   }
 
   console.log(`📩 ChatGPT का असली जवाब: "${replyText}"`);
@@ -209,11 +319,14 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     const res = await axios.post(firebaseUrl, dataPayload);
     if (res.status === 200 || res.status === 201) {
       console.log(`🔥 SUCCESS! Firebase में डेटा पुश हो गया! Path: ${subjectKey} ➔ ${chapterKey}`);
+      return true;
     } else {
       console.error(`❌ Firebase Error Status: ${res.status}`);
+      return true; // still a real (non-thinking) reply - don't re-block the queue on a Firebase hiccup
     }
   } catch (err) {
     console.error(`❌ Firebase Exception:`, err.response ? err.response.data : err.message);
+    return true; // same reasoning - the reply itself was final, only the push failed
   }
 }
 
@@ -266,15 +379,16 @@ async function handleIncomingMessage(event) {
       if (message.media) {
         streamLink = `${RENDER_URL}/stream/${message.id}`;
         console.log(`🔗 Stream Link Banna: ${streamLink}`);
+        preWarmStream(message.id); // fire-and-forget, don't block the queue on this
       }
 
-      pendingMedia["latest"] = { stream_link: streamLink, msg_id: message.id };
-
-      const chatgptEntity = await client.getEntity(CHATGPT_BOT);
       const msgText = currentText || "Media File";
 
-      await client.sendMessage(chatgptEntity, { message: msgText });
-      console.log("➡️ [STEP 2] ChatGPT Bot ko query bhej di gayi!");
+      // Har message ab QUEUE mein jaata hai - ek time pe sirf ek hi
+      // ChatGPT ke paas jaata hai, taaki Notes/DPP/lecture ek saath
+      // forward karne par unke links aapas mein mix na ho.
+      enqueueSourceMessage({ msgId: message.id, streamLink, text: msgText });
+      console.log(`➡️ [STEP 2] Queue mein daal diya gaya (position ke hisaab se process hoga)`);
       return;
     }
 
@@ -286,8 +400,15 @@ async function handleIncomingMessage(event) {
 
     if (isChatGPT) {
       console.log(`\n🤖 [STEP 3] ChatGPT Response Detect Hua: "${currentText}"`);
-      const mediaInfo = pendingMedia["latest"] || {};
-      await processReplyAndPushToFirebase(currentText, mediaInfo);
+      // currentMediaInfo hamesha sirf USI item ki jaankari rakhta hai jo
+      // is waqt queue mein process ho raha hai - isliye link kabhi mix
+      // nahi hota, chahe kitne bhi messages ek saath forward kiye ho.
+      const mediaInfo = currentMediaInfo || {};
+      const wasFinalAnswer = await processReplyAndPushToFirebase(currentText, mediaInfo);
+
+      if (wasFinalAnswer && resolveCurrentReply) {
+        resolveCurrentReply(); // ab queue agle item pe badh sakti hai
+      }
     }
 
   } catch (err) {
@@ -318,9 +439,11 @@ async function startServer() {
       console.error("❌ ChatGPT Bot ID resolve nahi hua:", e.message);
     }
 
-    // Resolve the source channel's numeric ID once - used for reliable matching
+    // Resolve the source channel's numeric ID (and cache the full entity)
+    // once - used for reliable matching AND reused by preWarmStream/stream
+    // route so they never need a redundant Telegram lookup.
     try {
-      const sourceEntity = await client.getEntity(SOURCE_CHAT);
+      sourceEntity = await client.getEntity(SOURCE_CHAT);
       sourceChatId = sourceEntity.id.toString();
       console.log("📡 Source Chat ID resolved:", sourceChatId);
     } catch (e) {
