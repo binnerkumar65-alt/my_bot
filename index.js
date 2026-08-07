@@ -20,6 +20,7 @@ const ffmpegPath = require("ffmpeg-static");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+app.use(express.json({ limit: "8mb" })); // client se aane waale base64 thumbnail frame ke liye
 
 // Environment Variables Configuration
 const apiId = parseInt(process.env.API_ID || "0");
@@ -58,6 +59,23 @@ let sourceEntity = null;
 // requests /stream/:msgId, the Telegram lookup is already done and the
 // response starts immediately instead of waiting on a fresh getMessages call.
 const messageCache = new Map();
+
+// Render ke free instance par RAM seemit hai - agar messageCache hamesha
+// badhta rahe (har naya forward add hota jaaye, kabhi hatta na) to instance
+// dheere-dheere slow/heavy ho jaata hai aur ussi se buffering badhti hai.
+// Har 12 naye source-messages ke baad, purane cache entries khud-ba-khud
+// saaf kar do - sirf sabse recent 3 rakho (jo abhi user dekh sakta hai),
+// baaki hata do.
+let sourceMessageCount = 0;
+const MESSAGES_PER_CLEANUP = 12;
+const KEEP_RECENT_IN_CACHE = 3;
+
+function cleanupMessageCache() {
+  const keys = Array.from(messageCache.keys());
+  const toDelete = keys.slice(0, Math.max(0, keys.length - KEEP_RECENT_IN_CACHE));
+  toDelete.forEach((k) => messageCache.delete(k));
+  console.log(`🧹 [CLEANUP] ${toDelete.length} purane messageCache entries hataye | ab bache: ${messageCache.size}`);
+}
 
 // -------------------------------------------------------------
 // SEQUENTIAL QUEUE - fixes Notes/DPP (or any batch of forwards)
@@ -363,6 +381,14 @@ app.get("/stream/:msgId", async (req, res) => {
 
     const range = req.headers.range;
 
+    // Notes/DPP links ab ?dl=1 ke saath aate hain -> force download.
+    // Video stream links ke bina query param ke aate hain -> inline (player mein play).
+    const forceDownload = req.query.dl === "1";
+    const asciiFallback = fileName.replace(/[^\x20-\x7E]/g, "_");
+    const encodedName = encodeURIComponent(fileName);
+    const dispositionType = forceDownload ? "attachment" : "inline";
+    const contentDisposition = `${dispositionType}; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`;
+
     if (range && fileSize) {
       // Partial content request (seeking / progressive playback)
       const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
@@ -375,6 +401,7 @@ app.get("/stream/:msgId", async (req, res) => {
         "Accept-Ranges": "bytes",
         "Content-Length": chunkSize,
         "Content-Type": mimeType,
+        "Content-Disposition": contentDisposition,
       });
 
       const stream = client.iterDownload({
@@ -389,16 +416,11 @@ app.get("/stream/:msgId", async (req, res) => {
       res.end();
     } else {
       // Full file request, still streamed in chunks (not buffered fully first)
-      // Non-ASCII filenames (Hindi text etc.) must be encoded - raw
-      // Content-Disposition headers only accept ASCII characters.
-      const asciiFallback = fileName.replace(/[^\x20-\x7E]/g, "_");
-      const encodedName = encodeURIComponent(fileName);
-
       res.writeHead(200, {
         "Content-Type": mimeType,
         "Content-Length": fileSize,
         "Accept-Ranges": "bytes",
-        "Content-Disposition": `inline; filename="${asciiFallback}"; filename*=UTF-8''${encodedName}`,
+        "Content-Disposition": contentDisposition,
       });
 
       const stream = client.iterDownload({ file: media, offset: bigInt(0) });
@@ -413,6 +435,55 @@ app.get("/stream/:msgId", async (req, res) => {
     if (!res.headersSent) {
       res.status(500).send("Streaming Error: " + err.message);
     }
+  }
+});
+
+// -------------------------------------------------------------
+// 1b. CLIENT-SIDE THUMBNAIL FALLBACK
+// Purane/thumb-less videos ke liye HTML pehli baar <video> tag se hi
+// frame render karta hai (4s wale point tak seek karke). Jaise hi woh
+// frame browser mein dikh jaata hai, HTML usi frame ko canvas se capture
+// karke yahan bhej deta hai. Hum yahan se ImgBB pe upload karte hain
+// (bilkul waise hi jaise naye messages ke liye startThumbUpload karta
+// hai) aur Firebase mein us entry ke thumb_link field mein permanently
+// save kar dete hain - taaki agli baar se seedha ImgBB link se load ho,
+// video ko dobara seek karne ki zaroorat na pade.
+// -------------------------------------------------------------
+app.post("/thumb-fallback", async (req, res) => {
+  try {
+    const { image, subjectKey, chapterName, entryKey } = req.body || {};
+    if (!image || !subjectKey || !chapterName || !entryKey) {
+      return res.status(400).json({ error: "image, subjectKey, chapterName, entryKey zaroori hain" });
+    }
+    if (!IMGBB_API_KEY) {
+      return res.status(500).json({ error: "IMGBB_API_KEY set nahi hai" });
+    }
+
+    // "data:image/jpeg;base64,...." prefix (agar client ne canvas.toDataURL
+    // se bheja hai) hata do - ImgBB ko sirf raw base64 chahiye.
+    const base64Image = String(image).replace(/^data:image\/\w+;base64,/, "");
+
+    const params = new URLSearchParams();
+    params.append("key", IMGBB_API_KEY);
+    params.append("image", base64Image);
+
+    const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", params);
+    const url = imgbbRes.data && imgbbRes.data.data && imgbbRes.data.data.url;
+    if (!url) {
+      console.error(`❌ [THUMB-FALLBACK] ImgBB response mein URL nahi mila, entryKey=${entryKey}`);
+      return res.status(502).json({ error: "ImgBB upload se URL nahi mila" });
+    }
+
+    // Sirf usi entry ke thumb_link field ko set karo - baaki data (title,
+    // stream_link, timestamp, etc.) chhede bina.
+    const firebasePath = `${FIREBASE_BASE_URL}/${encodeURIComponent(subjectKey)}/${encodeURIComponent(chapterName)}/${encodeURIComponent(entryKey)}/thumb_link.json`;
+    await axios.put(firebasePath, JSON.stringify(url));
+
+    console.log(`🖼️ [THUMB-FALLBACK] entryKey=${entryKey} -> ${url}`);
+    return res.json({ url });
+  } catch (e) {
+    console.error("❌ [THUMB-FALLBACK] Error:", e.response ? e.response.data : e.message);
+    return res.status(500).json({ error: "Internal error" });
   }
 });
 
@@ -497,7 +568,10 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 
   if (mediaInfo && mediaInfo.stream_link) {
     if (["@notes", "@dpp"].includes(contentType)) {
-      dataPayload["download_link"] = mediaInfo.stream_link;
+      // ?dl=1 -> /stream route ab Content-Disposition: attachment bhejega,
+      // isliye link par click karte hi seedha download shuru hoga, "view"
+      // wale tab mein khulne (aur phir device mein load hone) ki jagah.
+      dataPayload["download_link"] = `${mediaInfo.stream_link}?dl=1`;
     } else {
       dataPayload["stream_link"] = mediaInfo.stream_link;
 
@@ -583,6 +657,11 @@ async function handleIncomingMessage(event) {
     if (isSourceChat) {
       console.log(`\n📩 [STEP 1] Channel se Naya Message Aaya (ID: ${message.id})`);
 
+      sourceMessageCount++;
+      if (sourceMessageCount % MESSAGES_PER_CLEANUP === 0) {
+        cleanupMessageCache();
+      }
+
       let streamLink = "";
       if (message.media) {
         streamLink = `${RENDER_URL}/stream/${message.id}`;
@@ -631,10 +710,28 @@ async function handleIncomingMessage(event) {
 // -------------------------------------------------------------
 // 4. SERVER STARTUP
 // -------------------------------------------------------------
+// Render ka free instance ~15 min inactivity ke baad spin-down ho jaata hai,
+// aur agla request 50+ second le leta hai (cold start) - isi wajah se pehli
+// baar video load hone mein 20+ second lag rahe the aur user bhaag jaata tha.
+// Har 10 minute mein khud ko hi ek chhota ping bhej kar instance ko "active"
+// dikhaya jaata hai, taaki active hours mein spin-down hi na ho.
+// NOTE: ye sirf active-usage window mein help karta hai - agar poori raat/
+// din koi bhi traffic na aaye to Render phir bhi spin-down kar sakta hai.
+// Uss case ke liye external cron (UptimeRobot / cron-job.org) ya paid plan
+// zaroori hoga - code se poori tarah fix nahi ho sakta.
+function startKeepAlivePing() {
+  setInterval(() => {
+    axios.get(RENDER_URL).catch(() => {
+      // ping fail hone par bhi kuch nahi karna - agla interval try karega
+    });
+  }, 10 * 60 * 1000);
+}
+
 async function startServer() {
   // 1. Render Port binding
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server listening on 0.0.0.0:${PORT}`);
+    startKeepAlivePing();
   });
 
   // 2. Connect Telegram Client
