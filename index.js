@@ -12,6 +12,11 @@ const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 const bigInt = require("big-integer");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -130,13 +135,105 @@ async function processQueue() {
 }
 
 // -------------------------------------------------------------
-// THUMBNAIL (ImgBB) - Telegram videos already carry a small embedded
-// preview JPEG (the thumbnail the sending client generated), so we don't
-// need to download/decode the actual video to get a thumbnail. We grab
-// just that small thumb and host it on ImgBB, so the HTML can show it as
-// an instant <img> the moment the page loads - no video buffering wait.
+// THUMBNAIL (ImgBB) - Telegram's embedded preview JPEG was unreliable
+// (missing for a lot of videos -> nothing ever reached ImgBB/Firebase).
+// So instead we pull the ACTUAL video's frame at the ~4-second mark
+// (matches what the HTML already seeks to for its own client-side
+// fallback) by downloading just the first chunk of bytes and running
+// ffmpeg on it - no need to pull the whole video for a thumbnail.
 // -------------------------------------------------------------
 const thumbPromises = new Map(); // msgId -> Promise<string|null>
+
+// Sirf video ke shuru ka itna hissa download karo jitna 4-second-mark
+// tak ka frame nikaalne ke liye kaafi ho. Telegram/streaming-optimized
+// mp4 mein moov atom aam taur pe shuru mein hi hota hai (isi wajah se
+// /stream route pe seek turant kaam karta hai), isliye chhota chunk
+// bhi ffmpeg ke liye decode karne ke liye kaafi hota hai.
+async function downloadVideoChunk(message, maxBytes) {
+  const doc = message.media && message.media.document;
+  const fileSize = doc ? Number(doc.size) || 0 : 0;
+  const limit = fileSize ? Math.min(fileSize, maxBytes) : maxBytes;
+
+  const chunks = [];
+  const stream = client.iterDownload({
+    file: message.media,
+    offset: bigInt(0),
+    limit,
+  });
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// videoBuffer ke andar seekSeconds waale point ka frame nikaal kar
+// JPEG buffer wapas karta hai. Temp files hamesha cleanup ho jaati hain,
+// chahe ffmpeg fail ho jaaye.
+function extractFrame(videoBuffer, seekSeconds) {
+  const uid = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const videoPath = path.join(os.tmpdir(), `thumbsrc_${uid}.mp4`);
+  const framePath = path.join(os.tmpdir(), `thumbout_${uid}.jpg`);
+
+  return (async () => {
+    await fs.promises.writeFile(videoPath, videoBuffer);
+    try {
+      await new Promise((resolve, reject) => {
+        const args = [
+          "-y",
+          "-ss", String(seekSeconds),
+          "-i", videoPath,
+          "-frames:v", "1",
+          "-q:v", "2",
+          framePath,
+        ];
+        const proc = spawn(ffmpegPath, args);
+        let stderr = "";
+        proc.stderr.on("data", (d) => (stderr += d.toString()));
+        proc.on("error", reject);
+        proc.on("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`));
+        });
+      });
+      return await fs.promises.readFile(framePath);
+    } finally {
+      fs.promises.unlink(videoPath).catch(() => {});
+      fs.promises.unlink(framePath).catch(() => {});
+    }
+  })();
+}
+
+// Chhote chunk se try karo, phir bade chunk se, phir earlier timestamps
+// pe (agar video 4 second se chhota nikla). Sab fail ho to Telegram ke
+// apne embedded preview thumb pe fallback karo - taaki thumbnail kabhi
+// bhi poori tarah khaali na jaaye.
+async function generateThumbFrame(message) {
+  const attempts = [
+    { bytes: 3 * 1024 * 1024, seek: 4 },
+    { bytes: 8 * 1024 * 1024, seek: 4 },
+    { bytes: 8 * 1024 * 1024, seek: 1 },
+    { bytes: 8 * 1024 * 1024, seek: 0 },
+  ];
+
+  for (const attempt of attempts) {
+    try {
+      const videoBuffer = await downloadVideoChunk(message, attempt.bytes);
+      if (!videoBuffer || !videoBuffer.length) continue;
+      const frame = await extractFrame(videoBuffer, attempt.seek);
+      if (frame && frame.length) return frame;
+    } catch (e) {
+      console.error(`⚠️ [THUMB] ffmpeg attempt (bytes=${attempt.bytes}, seek=${attempt.seek}) fail hui:`, e.message);
+    }
+  }
+
+  console.log("⚠️ [THUMB] Sab ffmpeg attempts fail - Telegram ke embedded thumb pe fallback kar rahe hain.");
+  try {
+    return await client.downloadMedia(message, { thumb: -1 });
+  } catch (e) {
+    console.error("❌ [THUMB] Embedded thumb fallback bhi fail hui:", e.message);
+    return null;
+  }
+}
 
 function startThumbUpload(message) {
   if (!IMGBB_API_KEY) {
@@ -146,12 +243,15 @@ function startThumbUpload(message) {
   const msgId = message.id;
   const promise = (async () => {
     try {
-      const thumbBuffer = await client.downloadMedia(message, { thumb: -1 });
-      if (!thumbBuffer) return null;
+      const frameBuffer = await generateThumbFrame(message);
+      if (!frameBuffer || !frameBuffer.length) {
+        console.error(`❌ [THUMB] Koi bhi frame nahi mila msgId=${msgId}`);
+        return null;
+      }
 
       const params = new URLSearchParams();
       params.append("key", IMGBB_API_KEY);
-      params.append("image", thumbBuffer.toString("base64"));
+      params.append("image", frameBuffer.toString("base64"));
 
       const res = await axios.post("https://api.imgbb.com/1/upload", params);
       const url = res.data && res.data.data && res.data.data.url;
@@ -406,9 +506,13 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
       // already finished. Wait a little just in case, but never block the
       // Firebase push for long.
       if (mediaInfo.msg_id && thumbPromises.has(mediaInfo.msg_id)) {
+        // Timeout badhaya gaya (8s -> 20s) - ab hum chunk download + ffmpeg
+        // se real frame nikaal rahe hain, jo embedded-thumb download se
+        // dheema hota hai, isliye purana 8s timeout thumb ko beech mein
+        // hi kaat deta tha.
         const thumbUrl = await Promise.race([
           thumbPromises.get(mediaInfo.msg_id),
-          new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+          new Promise((resolve) => setTimeout(() => resolve(null), 20000)),
         ]);
         if (thumbUrl) dataPayload["thumb_link"] = thumbUrl;
         thumbPromises.delete(mediaInfo.msg_id);
