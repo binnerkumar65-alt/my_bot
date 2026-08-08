@@ -93,71 +93,51 @@ function cleanupTempFiles() {
 setInterval(cleanupTempFiles, 15 * 1000);
 
 // -------------------------------------------------------------
-// SEQUENTIAL QUEUE
+// PIPELINE QUEUE (no waiting) - har forward turant ChatGPT ko chala jaata
+// hai, agle ka wait kiye bina. Har item ki apni pehchan (msgId) "pending
+// replies" list mein FIFO order mein lag jaati hai - jab bhi ChatGPT ka
+// asli (tagged) jawab aata hai, wo hamesha sabse pehle wale pending item
+// se match hota hai, taaki data hamesha sahi jagah (sahi lecture/notes/dpp
+// entry) mein jaaye, chahe kitne bhi messages ek saath bheje gaye ho.
 // -------------------------------------------------------------
-const messageQueue = [];
-let isProcessingQueue = false;
-let currentMediaInfo = null;
-let resolveCurrentReply = null;
+const sendQueue = [];           // abhi tak ChatGPT ko bheje nahi gaye
+const pendingReplyQueue = [];   // bhej diye gaye, reply ka wait hai (FIFO)
+let isSending = false;
 
 function enqueueSourceMessage(item) {
-  messageQueue.push(item);
-  console.log(`📥 [QUEUE] Added Msg ID=${item.msgId} | queue size: ${messageQueue.length}`);
-  if (!isProcessingQueue) {
-    processQueue().catch((e) => {
-      console.error("❌ [QUEUE] processQueue error:", e);
-      isProcessingQueue = false;
+  sendQueue.push(item);
+  console.log(`📥 [QUEUE] Add hua ID=${item.msgId} | bhejne ko baaki: ${sendQueue.length}`);
+  if (!isSending) {
+    processSendQueue().catch((e) => {
+      console.error("❌ [QUEUE] processSendQueue error:", e);
+      isSending = false;
     });
   }
 }
 
-function waitForChatGPTReply(timeoutMs) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        console.log("⏱️ [QUEUE] ChatGPT Timeout.");
-        resolve();
-      }
-    }, timeoutMs);
+async function processSendQueue() {
+  if (isSending) return;
+  isSending = true;
 
-    resolveCurrentReply = () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        resolve();
-      }
-    };
-  });
-}
-
-async function processQueue() {
-  if (isProcessingQueue) return;
-  isProcessingQueue = true;
-
-  while (messageQueue.length > 0) {
-    const item = messageQueue.shift();
-    currentMediaInfo = { stream_link: item.streamLink, msg_id: item.msgId };
-
-    console.log(`\n➡️ [QUEUE] Processing ID=${item.msgId}`);
-
+  while (sendQueue.length > 0) {
+    const item = sendQueue.shift();
     try {
       if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
       await client.sendMessage(chatgptEntity, { message: item.text });
-      console.log("📨 [QUEUE] ChatGPT ko bhej diya.");
 
-      await waitForChatGPTReply(180000);
+      // Reply ka wait kiye BINA turant agle item pe badh jaayenge - ye
+      // item apni ID (msgId) ke saath pending list ke aakhir mein lag
+      // jaata hai, jawab aane par yahi se uthaya jayega (FIFO).
+      pendingReplyQueue.push({ msgId: item.msgId, streamLink: item.streamLink });
+      console.log(`📨 [QUEUE] ChatGPT ko bhej diya ID=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
     } catch (e) {
-      console.error("❌ [QUEUE] ChatGPT Error:", e.message);
+      console.error("❌ [QUEUE] ChatGPT Send Error:", e.message);
     }
 
-    resolveCurrentReply = null;
-    currentMediaInfo = null;
-    clearMemory();
+    await sleep(1200); // Telegram flood-limit se bachne ke liye halka sa gap
   }
 
-  isProcessingQueue = false;
+  isSending = false;
 }
 
 // -------------------------------------------------------------
@@ -407,9 +387,28 @@ async function handleIncomingMessage(event) {
                           (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
-      console.log(`🤖 ChatGPT ka message detected! Parsing reply...`);
-      const wasFinal = await processReplyAndPushToFirebase(message.text || "", currentMediaInfo || {});
-      if (wasFinal && resolveCurrentReply) resolveCurrentReply();
+      const replyText = message.text || "";
+      const replyClean = replyText.toLowerCase();
+      const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
+
+      if (isThinking) {
+        console.log(`⏳ AI abhi soch raha hai ("${replyText}") - pending queue ko chhedte nahi, wait continue.`);
+        return;
+      }
+
+      if (!replyText.includes("@")) {
+        console.log("ℹ️ Non-tagged reply aayi - koi pending item consume nahi karenge.");
+        return;
+      }
+
+      // Sabse pehle bheja gaya item hi is jawab ka sahi match hai (FIFO) -
+      // isliye links/tags kabhi mix nahi hote, chahe kitne bhi messages
+      // ek saath ya lagataar bina wait kiye bheje ho.
+      const matched = pendingReplyQueue.shift();
+      console.log(`🤖 ChatGPT ka message detected! Match hua ID=${matched ? matched.msgId : "unknown"} se. Parsing reply...`);
+
+      const mediaInfo = matched ? { stream_link: matched.streamLink, msg_id: matched.msgId } : {};
+      await processReplyAndPushToFirebase(replyText, mediaInfo);
       return;
     }
 
