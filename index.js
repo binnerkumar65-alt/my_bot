@@ -65,14 +65,14 @@ function clearMemory() {
     messageCache.clear();
     if (global.gc) {
       global.gc();
-      console.log("🧹 [RAM-CLEANUP] Memory/Heap saaf kar di gayi hai.");
+      console.log("🧹 [RAM-CLEANUP] Memory saaf ho gayi.");
     }
   } catch (e) {
     console.error("❌ RAM Cleanup Error:", e.message);
   }
 }
 
-// Har 2 minute mein RAM saaf hoga
+// Har 2 minute me RAM saaf
 setInterval(clearMemory, 2 * 60 * 1000);
 
 const TEMP_PREFIXES = ["transcoded_", "transcodesrc_", "thumbsrc_", "thumbout_"];
@@ -85,11 +85,8 @@ function cleanupTempFiles() {
       .forEach((f) => {
         const p = path.join(os.tmpdir(), f);
         fs.stat(p, (statErr, stats) => {
-          if (!statErr) {
-            // Delete files immediately if older than 10 seconds
-            if (now - stats.mtimeMs > 10 * 1000) {
-              fs.unlink(p, () => {});
-            }
+          if (!statErr && (now - stats.mtimeMs > 10 * 1000)) {
+            fs.unlink(p, () => {});
           }
         });
       });
@@ -107,10 +104,10 @@ let resolveCurrentReply = null;
 
 function enqueueSourceMessage(item) {
   messageQueue.push(item);
-  console.log(`📥 [QUEUE] Add hua ID=${item.msgId} | queue length: ${messageQueue.length}`);
+  console.log(`📥 [QUEUE] Added Msg ID=${item.msgId} | queue size: ${messageQueue.length}`);
   if (!isProcessingQueue) {
     processQueue().catch((e) => {
-      console.error("❌ [QUEUE] processQueue crash:", e);
+      console.error("❌ [QUEUE] processQueue error:", e);
       isProcessingQueue = false;
     });
   }
@@ -122,7 +119,7 @@ function waitForChatGPTReply(timeoutMs) {
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
-        console.log("⏱️ [QUEUE] ChatGPT Timeout - proceeding to next item.");
+        console.log("⏱️ [QUEUE] ChatGPT Timeout - agle item par badh rahe hain.");
         resolve();
       }
     }, timeoutMs);
@@ -150,11 +147,11 @@ async function processQueue() {
     try {
       if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
       await client.sendMessage(chatgptEntity, { message: item.text });
-      console.log("📨 [QUEUE] ChatGPT ko bhej diya, response ka wait kar rahe hain...");
+      console.log("📨 [QUEUE] ChatGPT ko bhej diya.");
 
       await waitForChatGPTReply(180000);
     } catch (e) {
-      console.error("❌ [QUEUE] Error:", e.message);
+      console.error("❌ [QUEUE] ChatGPT Error:", e.message);
     }
 
     resolveCurrentReply = null;
@@ -166,89 +163,48 @@ async function processQueue() {
 }
 
 // -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE (WITH 10s DELAY & AUTO TRIGGER)
+// SCREENSHOT BOT PIPELINE (DIRECT & RELIABLE)
 // -------------------------------------------------------------
-const screenshotBotWaiters = [];
-
-function waitForScreenshotBotMessage(timeoutMs, predicate) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (!settled) { settled = true; resolve(null); }
-    }, timeoutMs);
-
-    screenshotBotWaiters.push({
-      predicate,
-      resolve: (msg) => {
-        if (!settled) { settled = true; clearTimeout(timer); resolve(msg); }
-      },
-    });
-  });
-}
-
-function handleScreenshotBotMessage(message) {
-  for (let i = 0; i < screenshotBotWaiters.length; i++) {
-    if (screenshotBotWaiters[i].predicate(message)) {
-      const waiter = screenshotBotWaiters.splice(i, 1)[0];
-      waiter.resolve(message);
-      return;
-    }
-  }
-}
-
-async function triggerGetThumbs(msg) {
-  let success = false;
-  try {
-    if (msg) {
-      await msg.click({ text: "Get Thumbs" });
-      console.log(`🖱️ [THUMB-BOT] msg.click("Get Thumbs") try kiya.`);
-      success = true;
-    }
-  } catch (e) {}
-
-  try {
-    await client.sendMessage(screenshotEntity, { message: "Get Thumbs" });
-    console.log(`💬 [THUMB-BOT] Direct 'Get Thumbs' text message bhej diya.`);
-    success = true;
-  } catch (e) {}
-
-  return success;
-}
+let latestScreenshotPhoto = null;
 
 async function getThumbViaScreenshotBot(message) {
   if (!screenshotEntity || !sourceEntity) return null;
 
   try {
+    latestScreenshotPhoto = null;
+
     // 1. Forward Video to Screenshot Bot
     await client.forwardMessages(screenshotEntity, {
       messages: [message.id],
       fromPeer: sourceEntity,
     });
-    console.log(`📤 [THUMB-BOT] msgId=${message.id} Screenshot Bot ko forward kar diya.`);
+    console.log(`📤 [THUMB-BOT] Video ID=${message.id} Screenshot Bot ko forward kar diya.`);
 
-    // 2. Exact 10 Seconds ka delay (aapke kahe anusar)
-    console.log(`⏳ [THUMB-BOT] Video forward ho gaya. Exact 10 seconds wait kar rahe hain...`);
+    // 2. Exact 10 Seconds Wait
+    console.log(`⏳ [THUMB-BOT] 10 second ruk rahe hain 'Get Thumbs' trigger karne ke liye...`);
     await sleep(10000);
 
-    // 3. Catch menu or Trigger Direct
-    const menuMsg = await waitForScreenshotBotMessage(3000, (m) => !!m.replyMarkup);
-    console.log(`🚀 [THUMB-BOT] 10 second pure hue! Ab 'Get Thumbs' trigger kar rahe hain...`);
-    await triggerGetThumbs(menuMsg);
+    // 3. Send "Get Thumbs" Command Direct
+    await client.sendMessage(screenshotEntity, { message: "Get Thumbs" });
+    console.log(`🚀 [THUMB-BOT] 'Get Thumbs' bhej diya gaya!`);
 
-    // 4. Wait for Photo Reply (Up to 180s)
-    const photoMsg = await waitForScreenshotBotMessage(180000, (m) => {
-      return !!(m.photo || (m.media && m.media.className === 'MessageMediaPhoto'));
-    });
+    // 4. Wait for Photo Reply (Max 2 minutes)
+    let checks = 0;
+    while (!latestScreenshotPhoto && checks < 60) {
+      await sleep(2000);
+      checks++;
+    }
 
-    if (!photoMsg) {
-      console.error(`❌ [THUMB-BOT] msgId=${message.id}: Timeout (Photo nahi mili).`);
+    if (!latestScreenshotPhoto) {
+      console.error(`❌ [THUMB-BOT] Photo nahi mili.`);
       return null;
     }
 
-    // 5. Download Photo Buffer
-    const buffer = await client.downloadMedia(photoMsg);
+    const buffer = await client.downloadMedia(latestScreenshotPhoto);
+    latestScreenshotPhoto = null;
+
     if (buffer && buffer.length) {
-      console.log(`✅ [THUMB-BOT] Thumbnail image successfully mil gayi!`);
+      console.log(`✅ [THUMB-BOT] Thumbnail image download ho gayi!`);
       return buffer;
     }
     return null;
@@ -297,7 +253,7 @@ function startThumbUpload(message) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
       }
     } catch (e) {
-      console.error("❌ Thumb Upload Exception:", e.message);
+      console.error("❌ Thumb Upload Error:", e.message);
     } finally {
       resolvePromise(result);
       setTimeout(() => thumbPromises.delete(msgId), 30000);
@@ -309,7 +265,7 @@ function startThumbUpload(message) {
 // -------------------------------------------------------------
 // EXPRESS ROUTE
 // -------------------------------------------------------------
-app.get("/", (req, res) => res.send("Bot Active - Memory Optimized & 10s Trigger Set"));
+app.get("/", (req, res) => res.send("Bot Active - Memory Optimized"));
 
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -400,7 +356,7 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 
   try {
     await axios.post(`${FIREBASE_BASE_URL}/${subjectKey}/${chapterKey}.json`, dataPayload);
-    console.log(`🔥 Firebase mein successfully push ho gaya!`);
+    console.log(`🔥 Firebase me save ho gaya!`);
     return true;
   } catch (e) {
     return true;
@@ -415,23 +371,38 @@ async function handleIncomingMessage(event) {
     const message = event.message;
     if (!message) return;
 
-    const chatIdStr = message.chatId ? message.chatId.toString() : "";
+    // Direct Chat ID Check
+    let chatIdStr = "";
+    if (message.peerId) {
+      if (message.peerId.channelId) chatIdStr = message.peerId.channelId.toString();
+      else if (message.peerId.chatId) chatIdStr = message.peerId.chatId.toString();
+      else if (message.peerId.userId) chatIdStr = message.peerId.userId.toString();
+    }
+
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    if (sourceChatId && chatIdStr === sourceChatId) {
+    // 1. Source Channel Message
+    if (sourceEntity && (chatIdStr.includes(sourceEntity.id.toString()) || message.chatId?.toString() === sourceChatId)) {
+      console.log(`⚡ Channel se new message aaya ID=${message.id}`);
       let streamLink = `${RENDER_URL}/stream/${message.id}`;
       startThumbUpload(message);
       enqueueSourceMessage({ msgId: message.id, streamLink, text: message.text || "Media File" });
       return;
     }
 
+    // 2. ChatGPT Bot Reply
     if (chatgptBotId && senderIdSync === chatgptBotId) {
       const wasFinal = await processReplyAndPushToFirebase(message.text || "", currentMediaInfo || {});
       if (wasFinal && resolveCurrentReply) resolveCurrentReply();
+      return;
     }
 
+    // 3. Screenshot Bot Reply
     if (screenshotBotId && senderIdSync === screenshotBotId) {
-      handleScreenshotBotMessage(message);
+      if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
+        latestScreenshotPhoto = message;
+      }
+      return;
     }
   } catch (e) {
     console.error("❌ Event Error:", e.message);
@@ -439,18 +410,18 @@ async function handleIncomingMessage(event) {
 }
 
 // -------------------------------------------------------------
-// SERVER INIT (PURANI FILES SAFF KARNE KE SAATH)
+// SERVER INIT
 // -------------------------------------------------------------
 async function startServer() {
   app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
 
-  // 🧹 Server shuru hote hi RAM aur temp files saaf karna
-  console.log("🧹 [INIT] Purani sabhi temp files aur memory ko fully saaf kiya ja raha hai...");
+  console.log("🧹 [INIT] Memory aur cache clear kar rahe hain...");
   clearMemory();
   cleanupTempFiles();
 
   try {
     await client.connect();
+    
     chatgptEntity = await client.getEntity(CHATGPT_BOT);
     chatgptBotId = chatgptEntity.id.toString();
 
@@ -461,7 +432,7 @@ async function startServer() {
     screenshotBotId = screenshotEntity.id.toString();
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    console.log("🤖 Client Ready! Full Cleanup + 10s Delay Click Enabled.");
+    console.log("🤖 Client Ready! Channel Sync Restore Ho Gaya.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
