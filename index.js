@@ -6,7 +6,7 @@ process.on('uncaughtException', (err) => {
   console.error('❌ Uncaught Exception:', err);
 });
 
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
@@ -475,6 +475,49 @@ function handleScreenshotBotMessage(message) {
 const SCREENSHOT_MENU_TIMEOUT_MS = 30000; // bot options-menu bhejne mein itna time le sakta hai
 const SCREENSHOT_PHOTO_TIMEOUT_MS = 90000; // bot ko thumbnail generate karne mein itna time lag sakta hai
 
+// Message ke raw replyMarkup.rows[][].buttons se diye gaye text waala
+// inline button dhoondh kar, seedha Telegram ke raw messages.GetBotCallbackAnswer
+// API se asal "click" (callback query) bhejta hai - Telethon ke andar se
+// bilkul waisa hi click jaisa app mein tap karne par hota hai. gramJS ke
+// helper `message.click()` pe depend nahi karte (version ke hisaab se
+// missing/unreliable ho sakta hai) - ye seedha low-level API call hai,
+// isliye hamesha kaam karega jab tak button waqai inline-callback ho.
+async function clickInlineButton(msg, buttonText) {
+  const rows = msg.replyMarkup && msg.replyMarkup.rows;
+  if (!rows || !rows.length) {
+    console.error(`❌ [THUMB-BOT] msgId(menu)=${msg.id}: reply mein koi buttons hi nahi mile (replyMarkup empty).`);
+    return null;
+  }
+
+  let targetButton = null;
+  for (const row of rows) {
+    for (const btn of row.buttons) {
+      if (btn.text === buttonText) {
+        targetButton = btn;
+        break;
+      }
+    }
+    if (targetButton) break;
+  }
+
+  if (!targetButton) {
+    console.error(`❌ [THUMB-BOT] msgId(menu)=${msg.id}: "${buttonText}" naam ka button nahi mila.`);
+    return null;
+  }
+  if (!targetButton.data) {
+    console.error(`❌ [THUMB-BOT] msgId(menu)=${msg.id}: "${buttonText}" button inline-callback nahi hai (data missing).`);
+    return null;
+  }
+
+  return client.invoke(
+    new Api.messages.GetBotCallbackAnswer({
+      peer: screenshotEntity,
+      msgId: msg.id,
+      data: targetButton.data,
+    })
+  );
+}
+
 async function getThumbViaScreenshotBot(message) {
   if (!screenshotEntity) {
     console.log("⚠️ [THUMB-BOT] Screenshot bot resolve nahi hua tha - skip.");
@@ -503,17 +546,11 @@ async function getThumbViaScreenshotBot(message) {
       return null;
     }
 
-    // 3. "Get Thumbs" button asal mein CLICK karo. Ye buttons inline-keyboard
-    // hain (callback-based), reply-keyboard nahi - isliye plain text
-    // "Get Thumbs" bhejna sirf ek normal message ban jaata hai, bot use
-    // button-click nahi samajhta aur kuch nahi hota. GramJS ka
-    // message.click() method sahi tareeka hai - ye khud pehchan leta hai
-    // ki button inline hai ya reply-keyboard, aur uske hisaab se asli
-    // click (callback query) simulate karta hai.
-    const clickResult = await menuMsg.click({ text: "Get Thumbs" });
+    // 3. "Get Thumbs" button asal mein CLICK karo (raw callback API se,
+    // koi text message NAHI bhejte - ye inline-keyboard button hai).
+    const clickResult = await clickInlineButton(menuMsg, "Get Thumbs");
     if (!clickResult) {
-      console.error(`❌ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" button nahi mila/click fail hua.`);
-      return null;
+      return null; // clickInlineButton ne already specific error log kar diya hai
     }
     console.log(`🖱️ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" click kiya.`);
 
@@ -532,7 +569,7 @@ async function getThumbViaScreenshotBot(message) {
     }
     return null;
   } catch (e) {
-    console.error(`❌ [THUMB-BOT] Error msgId=${message.id}:`, e.message);
+    console.error(`❌ [THUMB-BOT] Error msgId=${message.id}:`, e && e.stack ? e.stack : e);
     return null;
   }
 }
