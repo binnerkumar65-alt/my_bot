@@ -454,6 +454,7 @@ async function uploadToArchive(buffer, idPrefix) {
   const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
 
   try {
+    console.log(`⬆️ [ARCHIVE] Upload shuru: ${uploadUrl}`);
     await axios.put(uploadUrl, buffer, {
       headers: {
         "Content-Type": "image/jpeg",
@@ -464,10 +465,20 @@ async function uploadToArchive(buffer, idPrefix) {
       },
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
+      // Pehle koi timeout nahi tha - agar Render se archive.org tak
+      // connection slow/blocked ho to axios bina kisi error ke hamesha
+      // ke liye latak sakta tha (na success, na error, chup-chaap). Ab
+      // 30 second ke baad khud hi fail ho jaayega taaki error dikhe aur
+      // fallback (Telegram embedded thumb) turant try ho sake.
+      timeout: 30000,
     });
+    console.log(`✅ [ARCHIVE] Upload ban gaya: ${uploadUrl}`);
     return `https://archive.org/download/${identifier}/${filename}`;
   } catch (e) {
-    console.error(`❌ [ARCHIVE] Upload fail hui:`, e.response ? e.response.data : e.message);
+    const reason = e.code === "ECONNABORTED"
+      ? "30s timeout - archive.org se connection slow/block ho raha hai"
+      : (e.response ? JSON.stringify(e.response.data) : e.message);
+    console.error(`❌ [ARCHIVE] Upload fail hui:`, reason);
     return null;
   }
 }
@@ -480,7 +491,16 @@ function startThumbUpload(message) {
   const msgId = message.id;
   const promise = (async () => {
     try {
-      const frameBuffer = await generateThumbFrame(message);
+      // Overall safety timeout - agar Telegram se chunk download hi kahin
+      // atak jaaye (network stall), to poori thumbnail pipeline hamesha ke
+      // liye latakti reh sakti thi bina kisi log/error ke. 90 second ke
+      // baad khud hi cancel karke error dikha do.
+      const frameBuffer = await Promise.race([
+        generateThumbFrame(message),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("generateThumbFrame 90s timeout - Telegram download atak gaya")), 90000)
+        ),
+      ]);
       if (!frameBuffer || !frameBuffer.length) {
         console.error(`❌ [THUMB] Koi bhi frame nahi mila msgId=${msgId}`);
         return null;
