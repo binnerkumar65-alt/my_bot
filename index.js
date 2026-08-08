@@ -110,6 +110,7 @@ let tagMsgCount = 0;
 
 async function loadTagMsgCount() {
   try {
+    // अब यह /Meta पूरे ऑब्जेक्ट को फेच करेगा जिसमें tagMsgCount एक property होगी
     const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`);
     if (res.data && typeof res.data === "object" && typeof res.data.tagMsgCount === "number") {
       tagMsgCount = res.data.tagMsgCount;
@@ -124,9 +125,9 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
-  // यहाँ put का उपयोग किया गया है ताकि /Meta नोड के अंदर tagMsgCount ऑब्जेक्ट पक्के तौर पर बन जाए
+  // अब यह /Meta नोड के अंदर object फॉर्मेट में tagMsgCount को पैच करेगा ताकि Meta key गायब न हो
   axios
-    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
+    .patch(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
     .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
