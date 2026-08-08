@@ -28,7 +28,7 @@ const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
 const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
-const TYPE_CHECKER_BOT = "@P840bot"; // <--- Notes/DPP Check karne wala bot
+const TYPE_CHECKER_BOT = "@P840bot";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
@@ -56,6 +56,8 @@ let screenshotEntity = null;
 
 const messageCache = new Map();
 const thumbPromises = new Map();
+// हर message के लिए अलग photo store करने का Map ताकि mix न हो
+const activeThumbRequests = new Map(); // msgId -> photoMessage
 
 // Helper Sleep
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -126,8 +128,8 @@ function saveTagMsgCount() {
 }
 
 const sendQueue = [];
-const pendingReplyQueue = []; // { msgId }
-const pendingTypeQueue = [];  // { msgId } -> @P840bot ke response ka wait karne ke liye
+const pendingReplyQueue = []; 
+const pendingTypeQueue = [];  
 let isSending = false;
 
 function enqueueForTagging(msgId, text) {
@@ -216,7 +218,6 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     console.error("❌ [FIREBASE] Pending entry read error:", e.response?.data || e.message);
   }
 
-  // @P840bot द्वारा तय किया गया content_type इस्तेमाल होगा, अगर नहीं है तो fallback @other
   const contentType = staged.content_type || "@other";
 
   let thumbUrl = null;
@@ -255,41 +256,41 @@ async function patchAiTagsToFirebase(msgId, replyText) {
 }
 
 // -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE
+// SCREENSHOT BOT PIPELINE (FIXED FOR UNIQUE THUMBNAILS)
 // -------------------------------------------------------------
-let latestScreenshotPhoto = null;
-
-async function getThumbViaScreenshotBot(streamLink) {
+async function getThumbViaScreenshotBot(msgId, streamLink) {
   if (!screenshotEntity) return null;
 
   try {
-    latestScreenshotPhoto = null;
-
+    // इस specific msgId के लिए रिक्वेस्ट रजिस्टर करें
     await client.sendMessage(screenshotEntity, { message: streamLink });
-    console.log(`📤 [THUMB-BOT] @screenshort17_bot ko URL bhej diya: ${streamLink}`);
+    console.log(`📤 [THUMB-BOT] (msgId=${msgId}) @screenshort17_bot ko URL bhej diya: ${streamLink}`);
 
     let waitCount = 0;
-    while (!latestScreenshotPhoto && waitCount < 90) {
+    while (!activeThumbRequests.has(msgId) && waitCount < 90) {
       await sleep(1000);
       waitCount++;
     }
 
-    if (!latestScreenshotPhoto) {
-      console.error(`⚠️ [THUMB-BOT] Screenshot bot se photo nahi mili (Timeout).`);
+    const photoMsg = activeThumbRequests.get(msgId);
+    activeThumbRequests.delete(msgId);
+
+    if (!photoMsg) {
+      console.error(`⚠️ [THUMB-BOT] (msgId=${msgId}) Screenshot bot se photo nahi mili (Timeout).`);
       return null;
     }
 
-    console.log(`📸 [THUMB-BOT] Photo mil gayi! Downloading...`);
-    const buffer = await client.downloadMedia(latestScreenshotPhoto);
-    latestScreenshotPhoto = null;
+    console.log(`📸 [THUMB-BOT] (msgId=${msgId}) Photo mil gayi! Downloading...`);
+    const buffer = await client.downloadMedia(photoMsg);
 
     if (buffer && buffer.length) {
-      console.log(`✅ [THUMB-BOT] Thumbnail image download ho gayi!`);
+      console.log(`✅ [THUMB-BOT] (msgId=${msgId}) Thumbnail image download ho gayi!`);
       return buffer;
     }
     return null;
   } catch (e) {
-    console.error(`❌ [THUMB-BOT] Pipeline Error:`, e.message);
+    console.error(`❌ [THUMB-BOT] (msgId=${msgId}) Pipeline Error:`, e.message);
+    activeThumbRequests.delete(msgId);
     return null;
   }
 }
@@ -303,7 +304,7 @@ async function uploadToArchive(buffer, idPrefix) {
     return null;
   }
 
-  const identifier = `${idPrefix}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`.toLowerCase();
+  const identifier = `${idPrefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`.toLowerCase();
   const filename = "thumb.jpg";
   const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
 
@@ -353,13 +354,13 @@ function startThumbUpload(msgId, streamLink) {
     let result = null;
     try {
       console.log(`⏳ [ARCHIVE] Process start for msgId=${msgId}...`);
-      const buffer = await getThumbViaScreenshotBot(streamLink);
+      const buffer = await getThumbViaScreenshotBot(msgId, streamLink);
       if (buffer) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
-        console.log(`🔗 [ARCHIVE] Direct Link: ${result}`);
+        console.log(`🔗 [ARCHIVE] Direct Link for msgId=${msgId}: ${result}`);
       }
     } catch (e) {
-      console.error("❌ Thumb Upload Error:", e.message);
+      console.error(`❌ Thumb Upload Error (msgId=${msgId}):`, e.message);
     } finally {
       resolvePromise(result);
       setTimeout(() => thumbPromises.delete(msgId), 10 * 60 * 1000);
@@ -483,7 +484,7 @@ async function pushDirectToFirebase(msgId, streamLink) {
     if (thumbUrl) {
       try {
         await axios.patch(pendingUrl, { thumb_link: thumbUrl });
-        console.log(`✅ [FIREBASE] thumb_link Pending mein patch हुआ (msgId=${msgId})`);
+        console.log(`✅ [FIREBASE] thumb_link Pending mein patch hua (msgId=${msgId})`);
       } catch (e) {
         console.error("❌ [FIREBASE] thumb_link patch error:", e.message);
       }
@@ -513,7 +514,6 @@ async function handleIncomingMessage(event) {
       console.log(`⚡ Channel se new message aaya ID=${message.id}`);
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
       
-      // Firebase mein instant pending push
       pushDirectToFirebase(message.id, streamLink);
 
       const captionText = message.message || message.text || "";
@@ -521,7 +521,6 @@ async function handleIncomingMessage(event) {
       if (isVideoMessage(message)) {
         startThumbUpload(message.id, streamLink);
       } else if (message.media && message.media.document) {
-        // DOCUMENT AAYA HAI: @P840bot ko type detection ke liye forward karo
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
         forwardDocToTypeChecker(message.id);
       }
@@ -534,7 +533,7 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 2. Reply from @P840bot (Notes vs DPP Type Checker)
+    // 2. Reply from @P840bot
     const isFromTypeChecker = (typeCheckerBotIdStr && senderIdSync === typeCheckerBotIdStr) ||
                              (typeCheckerBotIdStr && chatIdStr.includes(typeCheckerBotIdStr));
 
@@ -562,7 +561,7 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 3. ChatGPT Bot Reply (Subject & Chapter Identification Only)
+    // 3. ChatGPT Bot Reply
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
@@ -583,13 +582,27 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 4. Screenshot Bot Reply (@screenshort17_bot)
+    // 4. Screenshot Bot Reply (@screenshort17_bot) - FIXED MAPPING
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
     if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
-        latestScreenshotPhoto = message;
+        // अगर एक साथ कई वीडियो आ रहे हैं, तो सबसे पहली पेंडिंग रिक्वेस्ट को यह फोटो असाइन कर दो
+        for (const [msgId] of activeThumbRequests) {
+          if (!activeThumbRequests.get(msgId)) {
+            activeThumbRequests.set(msgId, message);
+            console.log(`📸 [THUMB-BOT] Screenshot matched for msgId=${msgId}`);
+            break;
+          }
+        }
+        // अगर कोई मैप नहीं मिली तो FIFO के हिसाब से सबसे पहली वाली को दे दो
+        if (activeThumbRequests.size > 0) {
+          const firstMsgId = activeThumbRequests.keys().next().value;
+          if (!activeThumbRequests.get(firstMsgId)) {
+            activeThumbRequests.set(firstMsgId, message);
+          }
+        }
       }
       return;
     }
