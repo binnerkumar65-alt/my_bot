@@ -415,6 +415,17 @@ function withTimeout(promise, ms, timeoutMessage) {
 // hamesha store karta hai) download karte hain - ek hi halka network call,
 // koi ffmpeg process nahi, koi bada buffer nahi.
 async function generateThumbFrame(message) {
+  // Kai videos (khaaskar documents/GIFs ki tarah bheji gayi files) mein
+  // Telegram apna embedded thumbnail banata hi nahi - aise case mein
+  // downloadMedia(thumb:-1) turant "nahi hai" bolne ki jagah poore 15
+  // second latak kar hi timeout deta tha. Ab pehle hi thumbs array check
+  // kar lete hain - agar khaali hai to bina wait kiye turant null.
+  const thumbs = message.media && message.media.document && message.media.document.thumbs;
+  if (!thumbs || !thumbs.length) {
+    console.log(`⚠️ [THUMB] msgId=${message.id} ke paas Telegram embedded thumb hai hi nahi - skip.`);
+    return null;
+  }
+
   try {
     const thumb = await withTimeout(
       client.downloadMedia(message, { thumb: -1 }),
