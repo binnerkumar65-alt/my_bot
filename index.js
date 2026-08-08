@@ -137,8 +137,13 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
+  // axios ka default transformRequest sirf plain-object/array data ko hi
+  // JSON.stringify karta hai - ek bare number (jaise 5) usse pass ho jaata
+  // hai, aur http adapter fir usko reject kar deta hai ("Data after
+  // transformation must be a string..."). Isliye number ko khud
+  // JSON.stringify karke bhejna zaroori hai (ban jaata hai string "5").
   axios
-    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, tagMsgCount)
+    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, JSON.stringify(tagMsgCount))
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
     .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
