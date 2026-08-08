@@ -139,7 +139,8 @@ async function loadTagMsgCount() {
 function saveTagMsgCount() {
   axios
     .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, tagMsgCount)
-    .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.message));
+    .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
+    .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
 
 const sendQueue = [];
@@ -340,6 +341,14 @@ async function uploadToArchive(buffer, idPrefix) {
   }
 }
 
+function isVideoMessage(message) {
+  const doc = message.media && message.media.document;
+  if (!doc) return false;
+  if (doc.mimeType && doc.mimeType.startsWith("video/")) return true;
+  if (doc.attributes && doc.attributes.some((a) => a.className === "DocumentAttributeVideo")) return true;
+  return false;
+}
+
 function startThumbUpload(msgId, streamLink) {
   let resolvePromise;
   const promise = new Promise((r) => { resolvePromise = r; });
@@ -529,7 +538,11 @@ async function handleIncomingMessage(event) {
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message आया ID=${message.id}`);
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
-      startThumbUpload(message.id, streamLink);
+      if (isVideoMessage(message)) {
+        startThumbUpload(message.id, streamLink); // sirf video ke liye - screenshot-bot ko forward hota hai
+      } else {
+        console.log(`📄 [THUMB] msgId=${message.id} document hai (video nahi) - screenshot-bot ko forward NAHI karenge.`);
+      }
       pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
       enqueueForTagging(message.id, message.message || message.text || "Media File"); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
       return;
