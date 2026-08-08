@@ -341,6 +341,17 @@ async function uploadToArchive(buffer, idPrefix) {
   }
 }
 
+function getDocumentFileName(message) {
+  const doc = message.media && message.media.document;
+  if (!doc || !doc.attributes) return null;
+  const nameAttr = doc.attributes.find((a) => a.className === "DocumentAttributeFilename");
+  if (!nameAttr || !nameAttr.fileName) return null;
+  // Filenames aksar underscore se bhare hote hain (jaise "समतल_में_गति_08_...")
+  // - ChatGPT ko bhejne se pehle readable bana dete hain taaki chapter/lecture
+  // sahi tag ho.
+  return nameAttr.fileName.replace(/\.[a-zA-Z0-9]+$/, "").replace(/_/g, " ").trim();
+}
+
 function isVideoMessage(message) {
   const doc = message.media && message.media.document;
   if (!doc) return false;
@@ -544,7 +555,13 @@ async function handleIncomingMessage(event) {
         console.log(`📄 [THUMB] msgId=${message.id} document hai (video nahi) - screenshot-bot ko forward NAHI karenge.`);
       }
       pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
-      enqueueForTagging(message.id, message.message || message.text || "Media File"); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
+      // Caption khaali ho sakta hai (jaise sirf ek PDF bina text ke forward
+      // hui ho) - us case mein document ka FILENAME hi ChatGPT ko bhejte
+      // hain, taaki wo phir bhi chapter/subject/lecture pehchan sake.
+      // "Media File" sirf tab jab dono (caption + filename) hi na milein.
+      const captionText = message.message || message.text || "";
+      const fallbackText = captionText || getDocumentFileName(message) || "Media File";
+      enqueueForTagging(message.id, fallbackText); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
       return;
     }
 
