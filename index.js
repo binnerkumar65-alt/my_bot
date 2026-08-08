@@ -120,8 +120,9 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
+  // सीधा नंबर भेजें ताकि Firebase में JSON फॉर्मेट की गड़बड़ी न हो
   axios
-    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, JSON.stringify(tagMsgCount))
+    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, tagMsgCount)
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
     .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
@@ -133,9 +134,10 @@ let isSending = false;
 
 function enqueueForTagging(msgId, text) {
   sendQueue.push({ msgId, text, isReminder: false });
-  console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | bhejne ko baaki: ${sendQueue.length}`);
-
+  
   tagMsgCount++;
+  console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | Current Counter: ${tagMsgCount} | bhejne ko baaki: ${sendQueue.length}`);
+
   if (tagMsgCount >= 10) {
     sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
     console.log(`🔁 [RULE-REMINDER] 10 messages ho gaye - rules dobara ChatGPT ko bheje jaa rahe hain.`);
@@ -255,13 +257,12 @@ async function patchAiTagsToFirebase(msgId, replyText) {
 }
 
 // -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE (FIXED MAPPING)
+// SCREENSHOT BOT PIPELINE
 // -------------------------------------------------------------
 async function getThumbViaScreenshotBot(msgId, streamLink) {
   if (!screenshotEntity) return null;
 
   try {
-    // यहाँ रिक्वेस्ट मैप में रजिस्टर कर दी ताकि फोटो आते ही कैच हो सके
     activeThumbRequests.set(msgId, null);
 
     await client.sendMessage(screenshotEntity, { message: streamLink });
@@ -583,7 +584,7 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 4. Screenshot Bot Reply (@screenshort17_bot) - PROPER MAPPING
+    // 4. Screenshot Bot Reply (@screenshort17_bot)
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
