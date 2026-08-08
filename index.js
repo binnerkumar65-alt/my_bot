@@ -149,22 +149,59 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     else if (/[\u0900-\u097F]/.test(seg)) chapterName = seg;
     else subjectName = seg;
   }
+  subjectName = subjectName.trim();
+  chapterName = chapterName.trim();
 
-  const tagPayload = {
-    subject: subjectName.trim(),
-    chapter: chapterName.trim(),
+  // HTML dashboard hamesha /{Subject}/{Chapter}/{msgId} nested path se
+  // padhta hai (subject match 'phys'/'chem'/'bio' se, phir usi subject ke
+  // andar chapter-naam ke node ke andar saari entries - videos + notes +
+  // dpp sab EK hi chapter-object ke andar, content_type field se pehchane
+  // jaate hain). Isliye final entry seedha usi nested path pe likhni hai -
+  // /Uploads/{msgId} pe flat likhna hi "chapters bikhar jaane" wala bug tha,
+  // kyunki HTML us path ko kabhi padhta hi nahi.
+  const lecNum = lecTag.replace(/^@?Lec\s*/i, "").trim();
+  const displayTitle = lecNum ? `${chapterName} — Lecture ${lecNum}` : chapterName;
+
+  // Thumbnail alag se, background mein (screenshot-bot pipeline se) taiyar
+  // ho rahi hoti hai - tags se pehle ya baad mein, kabhi bhi aa sakti hai.
+  // Yahan wait kar lete hain taaki final (nested) entry mein thumb_link
+  // kabhi chhoote na - warna Pending record delete hone ke baad thumb_link
+  // hamesha ke liye kho jaata.
+  let thumbUrl = null;
+  if (thumbPromises.has(msgId)) {
+    thumbUrl = await thumbPromises.get(msgId);
+  }
+
+  const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
+  let staged = {};
+  try {
+    const res = await axios.get(pendingUrl);
+    staged = res.data || {};
+  } catch (e) {
+    console.error("❌ [FIREBASE] Pending entry read error:", e.response?.data || e.message);
+  }
+
+  const finalPayload = {
+    msg_id: msgId,
+    stream_link: staged.stream_link || `${RENDER_URL}/stream/${msgId}`,
+    thumb_link: thumbUrl || staged.thumb_link || "",
+    timestamp: staged.timestamp || { ".sv": "timestamp" },
+    subject: subjectName,
+    chapter: chapterName,
     content_type: contentType,
     lecture_no: lecTag,
-    display_title: chapterName.trim(),
+    display_title: displayTitle,
     raw_reply: replyText,
   };
 
-  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Uploads/${msgId}.json`;
+  const finalUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(subjectName)}/${encodeURIComponent(chapterName)}/${msgId}.json`;
+
   try {
-    await axios.patch(pushUrl, tagPayload);
-    console.log(`🏷️ [FIREBASE] Tags PATCH ho gaye (msgId=${msgId}): ${tagPayload.subject} > ${tagPayload.chapter} > ${tagPayload.content_type}`);
+    await axios.put(finalUrl, finalPayload);
+    console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
+    axios.delete(pendingUrl).catch(() => {}); // ab staging entry ki zaroorat nahi
   } catch (e) {
-    console.error("❌ [FIREBASE] Tag patch error:", e.response?.data || e.message);
+    console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
 }
 
@@ -318,13 +355,17 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH - stream_link turant push hota hai jaise hi message aata
-// hai (ChatGPT ka wait kiye bina), fir thumb_link background mein PATCH
-// hota hai. Tags (subject/chapter/etc) alag se ChatGPT pipeline se isi
-// entry mein baad mein PATCH hote hain (upar patchAiTagsToFirebase).
+// FIREBASE STAGING PUSH - jab tak ChatGPT se subject/chapter tags nahi aa
+// jaate, humein pata hi nahi hota entry final nested path
+// (/{Subject}/{Chapter}/{msgId}) pe kahan jaayegi. Isliye stream_link
+// (aur baad mein thumb_link) turant sirf ek temporary /Pending/{msgId}
+// record mein save hote hain. Jaise hi tags aate hain, patchAiTagsToFirebase
+// isi Pending record ko padh kar sahi chapter ke andar FINAL likh deta hai
+// aur Pending record delete kar deta hai - isliye ab koi bhi entry kabhi
+// root mein akeli/bikhri hui flat nahi padi rahti.
 // -------------------------------------------------------------
 async function pushDirectToFirebase(msgId, streamLink) {
-  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Uploads/${msgId}.json`;
+  const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
 
   const dataPayload = {
     msg_id: msgId,
@@ -333,27 +374,28 @@ async function pushDirectToFirebase(msgId, streamLink) {
   };
 
   try {
-    await axios.put(pushUrl, dataPayload); // PUT - msgId hi key hai, taaki thumb_link baad mein isi path pe PATCH ho sake
-    console.log(`🔥 [FIREBASE] stream_link push ho gaya (msgId=${msgId})`);
+    await axios.put(pendingUrl, dataPayload); // PUT - msgId hi key hai, taaki thumb_link baad mein isi path pe PATCH ho sake
+    console.log(`🔥 [FIREBASE] stream_link Pending mein push ho gaya (msgId=${msgId})`);
   } catch (e) {
     console.error("❌ [FIREBASE] stream_link push error:", e.response?.data || e.message);
     return;
   }
 
   // Thumbnail background mein already ban rahi hai (startThumbUpload se) -
-  // jab wo ready ho jaaye, usi entry mein thumb_link add (PATCH) kar do.
+  // jab wo ready ho jaaye, Pending record mein thumb_link add (PATCH) kar do,
+  // taaki patchAiTagsToFirebase ko final entry banate waqt mil jaaye.
   if (thumbPromises.has(msgId)) {
     console.log(`⏳ [FIREBASE] msgId=${msgId} ke thumbnail ka wait ho raha hai...`);
     const thumbUrl = await thumbPromises.get(msgId);
     if (thumbUrl) {
       try {
-        await axios.patch(pushUrl, { thumb_link: thumbUrl });
-        console.log(`✅ [FIREBASE] thumb_link add ho gaya (msgId=${msgId}): ${thumbUrl}`);
+        await axios.patch(pendingUrl, { thumb_link: thumbUrl });
+        console.log(`✅ [FIREBASE] thumb_link Pending mein add ho gaya (msgId=${msgId}): ${thumbUrl}`);
       } catch (e) {
         console.error("❌ [FIREBASE] thumb_link patch error:", e.response?.data || e.message);
       }
     } else {
-      console.log(`⚠️ [FIREBASE] msgId=${msgId} ke liye thumbnail nahi mil paayi, stream_link phir bhi save hai.`);
+      console.log(`⚠️ [FIREBASE] msgId=${msgId} ke liye thumbnail nahi mil paayi, stream_link phir bhi Pending mein hai.`);
     }
   }
 }
