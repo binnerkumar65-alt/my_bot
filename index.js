@@ -27,6 +27,7 @@ const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
 const SOURCE_CHAT = "@sxhckfufig";
+const CHATGPT_BOT = "@chatgpt";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
@@ -43,6 +44,8 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
+let chatgptBotIdStr = null;
+let chatgptEntity = null;
 let sourceChatIdStr = null;
 let sourceEntity = null;
 let screenshotBotIdStr = null;
@@ -88,6 +91,81 @@ function cleanupTempFiles() {
   });
 }
 setInterval(cleanupTempFiles, 15 * 1000);
+
+// -------------------------------------------------------------
+// CHATGPT TAGGING PIPELINE (enrichment only) - stream_link/thumb_link
+// already push turant ho jaate hain (neeche pushDirectToFirebase se).
+// Ye pipeline sirf ADDITIONAL tags (subject/chapter/content_type/lecture_no)
+// nikaal ke SAME /Uploads/{msgId} entry mein PATCH karta hai - koi naya
+// entry kabhi nahi banata, isliye tags kabhi galat jagah nahi jaate.
+// Matching FIFO order se hoti hai (jis order mein ChatGPT ko bheja gaya,
+// usi order mein uske jawab wapas aate hain).
+// -------------------------------------------------------------
+const sendQueue = [];
+const pendingReplyQueue = []; // { msgId }
+let isSending = false;
+
+function enqueueForTagging(msgId, text) {
+  sendQueue.push({ msgId, text });
+  console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | bhejne ko baaki: ${sendQueue.length}`);
+  if (!isSending) {
+    processSendQueue().catch((e) => {
+      console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
+      isSending = false;
+    });
+  }
+}
+
+async function processSendQueue() {
+  if (isSending) return;
+  isSending = true;
+
+  while (sendQueue.length > 0) {
+    const item = sendQueue.shift();
+    try {
+      if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
+      await client.sendMessage(chatgptEntity, { message: item.text });
+      pendingReplyQueue.push({ msgId: item.msgId });
+      console.log(`📨 [TAG-QUEUE] ChatGPT ko bheja gaya msgId=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
+    } catch (e) {
+      console.error("❌ [TAG-QUEUE] Send error:", e.message);
+    }
+    await sleep(1200); // Telegram flood-limit se bachne ke liye halka gap
+  }
+
+  isSending = false;
+}
+
+async function patchAiTagsToFirebase(msgId, replyText) {
+  const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
+  let contentType = "@other", lecTag = "", subjectName = "General", chapterName = "General_Lectures";
+
+  for (const seg of segments) {
+    const sLower = seg.toLowerCase();
+    if (sLower.startsWith("dpp")) contentType = "@dpp";
+    else if (sLower.startsWith("notes")) contentType = "@notes";
+    else if (sLower.startsWith("lec")) lecTag = "@" + seg;
+    else if (/[\u0900-\u097F]/.test(seg)) chapterName = seg;
+    else subjectName = seg;
+  }
+
+  const tagPayload = {
+    subject: subjectName.trim(),
+    chapter: chapterName.trim(),
+    content_type: contentType,
+    lecture_no: lecTag,
+    display_title: chapterName.trim(),
+    raw_reply: replyText,
+  };
+
+  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Uploads/${msgId}.json`;
+  try {
+    await axios.patch(pushUrl, tagPayload);
+    console.log(`🏷️ [FIREBASE] Tags PATCH ho gaye (msgId=${msgId}): ${tagPayload.subject} > ${tagPayload.chapter} > ${tagPayload.content_type}`);
+  } catch (e) {
+    console.error("❌ [FIREBASE] Tag patch error:", e.response?.data || e.message);
+  }
+}
 
 // -------------------------------------------------------------
 // SCREENSHOT BOT PIPELINE
@@ -239,9 +317,10 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH - AB SEEDHA, AI wala tagging hata diya gaya hai. Sirf
-// stream_link (video) aur thumb_link (archive.org se aayi thumbnail)
-// push hote hain, kisi ChatGPT reply/tag ka koi matlab nahi raha.
+// FIREBASE PUSH - stream_link turant push hota hai jaise hi message aata
+// hai (ChatGPT ka wait kiye bina), fir thumb_link background mein PATCH
+// hota hai. Tags (subject/chapter/etc) alag se ChatGPT pipeline se isi
+// entry mein baad mein PATCH hote hain (upar patchAiTagsToFirebase).
 // -------------------------------------------------------------
 async function pushDirectToFirebase(msgId, streamLink) {
   const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Uploads/${msgId}.json`;
@@ -295,17 +374,48 @@ async function handleIncomingMessage(event) {
 
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    // 1. Source Channel Message - ab seedha push, ChatGPT ko kuch bhejna
-    // hi nahi hai.
+    // 1. Source Channel Message - stream_link turant push hota hai, aur
+    // saath hi ChatGPT ko tagging ke liye bhi bhej dete hain (enrichment).
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message आया ID=${message.id}`);
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
       startThumbUpload(message.id, streamLink);
       pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
+      enqueueForTagging(message.id, message.text || "Media File"); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
       return;
     }
 
-    // 2. New Screenshot Bot Reply (@screenshort17_bot)
+    // 2. ChatGPT Bot Reply - sirf TAGS nikaal ke same /Uploads/{msgId}
+    // entry mein PATCH karta hai, koi naya entry nahi banata.
+    const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
+                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
+
+    if (isFromChatGPT) {
+      const replyText = message.text || "";
+      const replyClean = replyText.toLowerCase();
+      const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
+
+      if (isThinking) {
+        console.log(`⏳ AI abhi soch raha hai ("${replyText}") - pending queue ko chhedte nahi, edit ka wait.`);
+        return;
+      }
+
+      if (!replyText.includes("@")) {
+        console.log("ℹ️ Non-tagged reply aayi - koi pending item consume nahi karenge.");
+        return;
+      }
+
+      const matched = pendingReplyQueue.shift();
+      if (matched) {
+        console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
+        await patchAiTagsToFirebase(matched.msgId, replyText);
+      } else {
+        console.log("⚠️ ChatGPT reply aayi lekin koi pending item match karne ke liye nahi mila.");
+      }
+      return;
+    }
+
+    // 3. New Screenshot Bot Reply (@screenshort17_bot)
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
@@ -333,15 +443,35 @@ async function startServer() {
   try {
     await client.connect();
 
+    chatgptEntity = await client.getEntity(CHATGPT_BOT);
+    chatgptBotIdStr = chatgptEntity.id.toString();
+
     sourceEntity = await client.getEntity(SOURCE_CHAT);
     sourceChatIdStr = sourceEntity.id.toString();
 
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
     screenshotBotIdStr = screenshotEntity.id.toString();
 
-    console.log(`📌 Target IDs Loaded - Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
+    console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+
+    // ChatGPT bot pehle "सोच..." bhejta hai (NewMessage se pakda jaata hai),
+    // fir USI message ko EDIT karke asli tags daalta hai - is raw update
+    // handler ke bina wo asli jawab kabhi detect hi nahi hoga.
+    client.addEventHandler(async (update) => {
+      try {
+        if (
+          update.className === "UpdateEditMessage" ||
+          update.className === "UpdateEditChannelMessage"
+        ) {
+          console.log("✏️ Raw Edit Update Detect Hua, process kar rahe hain...");
+          await handleIncomingMessage({ message: update.message });
+        }
+      } catch (e) {
+        console.error("❌ Raw Edit Handler Error:", e.message);
+      }
+    });
 
     console.log("🤖 Client Ready! Detection pipeline synchronized.");
   } catch (e) {
