@@ -101,13 +101,63 @@ setInterval(cleanupTempFiles, 15 * 1000);
 // Matching FIFO order se hoti hai (jis order mein ChatGPT ko bheja gaya,
 // usi order mein uske jawab wapas aate hain).
 // -------------------------------------------------------------
+// -------------------------------------------------------------
+// RULE REMINDER - har 10 tagging-messages ke baad ChatGPT bot ko rules
+// dobara yaad dilaate hain (kyunki lambi conversation mein wo bhoolne
+// lagta hai). Counter Firebase mein persist hota hai taaki Render restart/
+// sleep hone par bhi count na khoye. Reminder ka reply pendingReplyQueue
+// mein kabhi nahi jaata (isReminder flag se), aur neeche event handler
+// mein bhi sirf "@" se SHURU hone waali replies hi asli tag maani jaati
+// hain - isliye reminder ka acknowledgement reply (jisme udaharan ke
+// taur par "@Physics" jaise words ho sakte hain) kabhi galti se kisi
+// asli pending item se match nahi hoga.
+// -------------------------------------------------------------
+const RULE_REMINDER_TEXT = `नियम याद दिला रहा हूँ:
+1. विषय टैग (जैसे: @Physics, @Biology)
+2. अध्याय टैग (जैसे: @समतल में गति)
+3. सामग्री प्रकार टैग:
+   * अगर टेक्स्ट में "Practice Sheet" या "DPP" है ➔ @dpp
+   * अगर टेक्स्ट में स्पष्ट रूप से "Notes" लिखा है ➔ @notes
+   * इन दोनों के अलावा कुछ भी और हो (जैसे Extra Lecture, Video, Test आदि) ➔ @other
+4. लेक्चर नंबर (अगर टेक्स्ट में दिया हो) ➔ @Lec XX
+
+अगला इनपुट इसी नियम अनुसार टैग करना - सिर्फ tags ke saath reply karna, aur kuch nahi.`;
+
+let tagMsgCount = 0;
+
+async function loadTagMsgCount() {
+  try {
+    const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`);
+    tagMsgCount = typeof res.data === "number" ? res.data : 0;
+    console.log(`🔢 [RULE-REMINDER] Counter Firebase se load hua: ${tagMsgCount}`);
+  } catch (e) {
+    console.error("❌ [RULE-REMINDER] Counter load error:", e.message);
+    tagMsgCount = 0;
+  }
+}
+
+function saveTagMsgCount() {
+  axios
+    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, tagMsgCount)
+    .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.message));
+}
+
 const sendQueue = [];
 const pendingReplyQueue = []; // { msgId }
 let isSending = false;
 
 function enqueueForTagging(msgId, text) {
-  sendQueue.push({ msgId, text });
+  sendQueue.push({ msgId, text, isReminder: false });
   console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | bhejne ko baaki: ${sendQueue.length}`);
+
+  tagMsgCount++;
+  if (tagMsgCount >= 10) {
+    sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
+    console.log(`🔁 [RULE-REMINDER] 10 messages ho gaye - rules dobara ChatGPT ko bheje jaa rahe hain, counter reset.`);
+    tagMsgCount = 0;
+  }
+  saveTagMsgCount();
+
   if (!isSending) {
     processSendQueue().catch((e) => {
       console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
@@ -125,8 +175,14 @@ async function processSendQueue() {
     try {
       if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
       await client.sendMessage(chatgptEntity, { message: item.text });
-      pendingReplyQueue.push({ msgId: item.msgId });
-      console.log(`📨 [TAG-QUEUE] ChatGPT ko bheja gaya msgId=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
+      if (item.isReminder) {
+        // Reminder ka koi msgId nahi hota - isliye pendingReplyQueue mein
+        // kabhi nahi daalte, taaki iska reply kisi asli item se match na ho.
+        console.log(`🔁 [RULE-REMINDER] Rules ChatGPT ko bhej diye.`);
+      } else {
+        pendingReplyQueue.push({ msgId: item.msgId });
+        console.log(`📨 [TAG-QUEUE] ChatGPT ko bheja gaya msgId=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
+      }
     } catch (e) {
       console.error("❌ [TAG-QUEUE] Send error:", e.message);
     }
@@ -184,6 +240,11 @@ async function patchAiTagsToFirebase(msgId, replyText) {
   const finalPayload = {
     msg_id: msgId,
     stream_link: staged.stream_link || `${RENDER_URL}/stream/${msgId}`,
+    // Notes/DPP files ke liye HTML seedha download_link use karta hai
+    // (file-row href) - stream_link video-player ke liye hai, files ke liye nahi.
+    download_link: (contentType === "@notes" || contentType === "@dpp")
+      ? `${RENDER_URL}/download/${msgId}`
+      : "",
     thumb_link: thumbUrl || staged.thumb_link || "",
     timestamp: staged.timestamp || { ".sv": "timestamp" },
     subject: subjectName,
@@ -355,6 +416,52 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
+// DIRECT DOWNLOAD ROUTE - notes/dpp (PDFs, images, etc) ke liye. /stream
+// route hamesha "video/mp4" bhejta hai aur browser mein inline khulta/
+// buffer karta hai, jo files ke liye galat hai. Ye route asli mimeType +
+// filename Telegram document se nikaal ke Content-Disposition: attachment
+// bhejta hai, taaki click karte hi seedha device pe download ho, koi
+// viewer na khule.
+// -------------------------------------------------------------
+app.get("/download/:msgId", async (req, res) => {
+  try {
+    const msgId = parseInt(req.params.msgId);
+    if (!sourceEntity) sourceEntity = await client.getEntity(SOURCE_CHAT);
+
+    const messages = await client.getMessages(sourceEntity, { ids: msgId });
+    if (!messages || !messages[0] || !messages[0].media) return res.status(404).send("Not Found");
+
+    const message = messages[0];
+    const media = message.media;
+    const doc = media.document;
+    const fileSize = Number(doc ? doc.size : 0);
+    const mimeType = (doc && doc.mimeType) || "application/octet-stream";
+
+    let fileName = `file_${msgId}`;
+    if (doc && doc.attributes) {
+      const nameAttr = doc.attributes.find((a) => a.className === "DocumentAttributeFilename");
+      if (nameAttr && nameAttr.fileName) fileName = nameAttr.fileName;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": mimeType,
+      "Content-Length": fileSize,
+      "Content-Disposition": `attachment; filename="${encodeURIComponent(fileName)}"`,
+    });
+
+    const stream = client.iterDownload({ file: media, offset: bigInt(0) });
+    for await (const chunk of stream) {
+      if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+    }
+    res.end();
+  } catch (e) {
+    if (!res.headersSent) res.status(500).send("Download Error");
+  } finally {
+    clearMemory();
+  }
+});
+
+// -------------------------------------------------------------
 // FIREBASE STAGING PUSH - jab tak ChatGPT se subject/chapter tags nahi aa
 // jaate, humein pata hi nahi hota entry final nested path
 // (/{Subject}/{Chapter}/{msgId}) pe kahan jaayegi. Isliye stream_link
@@ -448,8 +555,13 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      if (!replyText.includes("@")) {
-        console.log("ℹ️ Non-tagged reply aayi - koi pending item consume nahi karenge.");
+      if (!replyText.trim().startsWith("@")) {
+        // Ya to non-tagged reply hai, ya RULE_REMINDER ka acknowledgement
+        // (jisme udaharan ke taur par beech mein "@Physics" jaisa text ho
+        // sakta hai, isliye sirf "@" se SHURU hone waali reply ko hi asli
+        // tag maanna zaroori hai). Dono cases mein koi pending item consume
+        // nahi karte.
+        console.log("ℹ️ Non-tagged (ya reminder ka) reply aayi - koi pending item consume nahi karenge.");
         return;
       }
 
@@ -499,6 +611,8 @@ async function startServer() {
 
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
     screenshotBotIdStr = screenshotEntity.id.toString();
+
+    await loadTagMsgCount();
 
     console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
