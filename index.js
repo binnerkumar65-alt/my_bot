@@ -8,7 +8,7 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage } = require("telegram/events");
+const { NewMessage, EditedMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 const bigInt = require("big-integer");
@@ -450,6 +450,11 @@ async function startServer() {
     console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+    // YE LINE MISSING THI - ChatGPT bot pehle "सोच..." bhejta hai (NewMessage),
+    // fir USI message ko EDIT karke asli tags/answer daalta hai. Bina is
+    // listener ke, wo asli jawab kabhi detect hi nahi hota tha aur
+    // Firebase mein data push hi nahi ho pata tha.
+    client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
     console.log("🤖 Client Ready! Detection pipeline synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
