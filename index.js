@@ -309,27 +309,37 @@ function serveLocalFile(filePath, req, res) {
   });
 }
 
-// Bahut purani transcoded cache files ko disk se saaf karte raho, warna
-// Render ke free tier ka seemit disk bhar sakta hai.
-const TRANSCODE_CACHE_MAX_AGE_MS = 3 * 60 * 60 * 1000; // 3 hours
-function cleanupTranscodeCache() {
+// User ne mana kiya hai ki Render ke disk par kuch bhi download/cached
+// padа na rahe - har video/thumbnail download ke liye hum apne temp
+// files ek fixed naming pattern se banate hain (transcoded_, transcodesrc_,
+// thumbsrc_, thumbout_). Normal flow mein ye sab apne-aap turant delete ho
+// jaate hain (har function ke finally block mein) - ye cleanup sirf ek
+// SAFETY NET hai un cases ke liye jab process crash ho jaaye ya koi
+// unlink chhoot jaaye. Har 1 minute mein chalta hai aur 1 minute se
+// purani kisi bhi hamari temp file ko hata deta hai - matlab transcoded
+// quality cache bhi zyada se zyada ~1 minute tak hi disk par rehta hai
+// (uske baad quality dobara switch karne par fresh transcode hoga).
+const TEMP_FILE_PREFIXES = ["transcoded_", "transcodesrc_", "thumbsrc_", "thumbout_"];
+const TEMP_FILE_MAX_AGE_MS = 60 * 1000; // 1 minute
+function cleanupTempFiles() {
   fs.readdir(os.tmpdir(), (err, files) => {
     if (err) return;
     const now = Date.now();
     files
-      .filter((f) => f.startsWith("transcoded_"))
+      .filter((f) => TEMP_FILE_PREFIXES.some((prefix) => f.startsWith(prefix)))
       .forEach((f) => {
         const p = path.join(os.tmpdir(), f);
         fs.stat(p, (statErr, stats) => {
           if (statErr) return;
-          if (now - stats.mtimeMs > TRANSCODE_CACHE_MAX_AGE_MS) {
+          if (now - stats.mtimeMs > TEMP_FILE_MAX_AGE_MS) {
             fs.unlink(p, () => {});
           }
         });
       });
   });
 }
-setInterval(cleanupTranscodeCache, 30 * 60 * 1000);
+setInterval(cleanupTempFiles, 60 * 1000);
+cleanupTempFiles(); // startup par bhi ek baar chala do, purani reboot se bachi files saaf karne ke liye
 
 // -------------------------------------------------------------
 // THUMBNAIL (archive.org) - Telegram's embedded preview JPEG was unreliable
@@ -340,6 +350,39 @@ setInterval(cleanupTranscodeCache, 30 * 60 * 1000);
 // ffmpeg on it - no need to pull the whole video for a thumbnail.
 // -------------------------------------------------------------
 const thumbPromises = new Map(); // msgId -> Promise<string|null>
+
+// -------------------------------------------------------------
+// THUMBNAIL QUEUE - ek time pe sirf EK thumbnail generate hota hai.
+// Pehle har naye video ke liye turant, saath-saath (parallel) download
+// shuru ho jaata tha - agar Notes/DPP ki tarah 2-3 videos ek saath
+// forward ho jaayein, sabke chunk downloads ek hi Telegram connection
+// par ek saath maange jaate the. Ye contention hi timeouts (msgId=802
+// jaisa "Sab attempts fail") ki asli wajah ban raha tha. Ab thumbnails
+// ek sequential queue se, ek-ek karke process hote hain - naya video
+// stream link turant milta hai (streamLink pehle hi bana diya jaata
+// hai), sirf thumbnail image thoda der se aa sakti hai jab queue mein
+// aage kaam ho.
+// -------------------------------------------------------------
+const thumbQueue = [];
+let isThumbQueueRunning = false;
+
+function enqueueThumbJob(job) {
+  thumbQueue.push(job);
+  if (!isThumbQueueRunning) runThumbQueue();
+}
+
+async function runThumbQueue() {
+  isThumbQueueRunning = true;
+  while (thumbQueue.length > 0) {
+    const job = thumbQueue.shift();
+    try {
+      await job();
+    } catch (e) {
+      console.error("❌ [THUMB-QUEUE] Job crash hua:", e.message);
+    }
+  }
+  isThumbQueueRunning = false;
+}
 
 // Sirf video ke shuru ka itna hissa download karo jitna 4-second-mark
 // tak ka frame nikaalne ke liye kaafi ho. Telegram/streaming-optimized
@@ -354,10 +397,21 @@ const thumbPromises = new Map(); // msgId -> Promise<string|null>
 const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 15000;
 
 function withTimeout(promise, ms, timeoutMessage) {
-  return Promise.race([
+  let timedOut = false;
+  const guarded = Promise.race([
     promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(timeoutMessage)), ms)),
+    new Promise((_, reject) => setTimeout(() => { timedOut = true; reject(new Error(timeoutMessage)); }, ms)),
   ]);
+  // Diagnostic: agar timeout fire hone ke BAAD bhi original request
+  // eventually settle ho (success ya real error), wo yahan chhup nahi
+  // jaana chahiye - warna hum hamesha generic "timeout" hi dekhte
+  // rahenge aur asli wajah (jaise Telegram FLOOD_WAIT / rate-limit)
+  // kabhi pata hi nahi chalegi.
+  promise.then(
+    () => { if (timedOut) console.log(`ℹ️ [THUMB-DIAG] Timeout ke baad request asal mein safal ho gaya tha - Telegram bas dheema tha, poori tarah band nahi tha.`); },
+    (err) => { if (timedOut) console.error(`ℹ️ [THUMB-DIAG] Timeout ke baad asli underlying error mila:`, err.message); }
+  );
+  return guarded;
 }
 
 async function downloadVideoChunk(message, maxBytes) {
@@ -511,7 +565,16 @@ function startThumbUpload(message) {
     return;
   }
   const msgId = message.id;
-  const promise = (async () => {
+
+  // thumbPromises mein turant (synchronously) ek pending promise daal do,
+  // taaki koi aur code jo thumbPromises.get(msgId) check kare use turant
+  // mil jaaye - chahe actual kaam abhi queue mein wait kar raha ho.
+  let resolvePromise;
+  const promise = new Promise((resolve) => { resolvePromise = resolve; });
+  thumbPromises.set(msgId, promise);
+
+  enqueueThumbJob(async () => {
+    let result = null;
     try {
       // Overall safety timeout - agar Telegram se chunk download hi kahin
       // atak jaaye (network stall), to poori thumbnail pipeline hamesha ke
@@ -525,27 +588,25 @@ function startThumbUpload(message) {
       ]);
       if (!frameBuffer || !frameBuffer.length) {
         console.error(`❌ [THUMB] Koi bhi frame nahi mila msgId=${msgId}`);
-        return null;
-      }
-
-      const url = await uploadToArchive(frameBuffer, `labdesk-thumb-${msgId}`);
-      if (url) {
-        console.log(`🖼️ [THUMB] Archive.org upload OK msgId=${msgId}: ${url}`);
       } else {
-        console.error(`❌ [THUMB] Archive.org se URL nahi mila, msgId=${msgId}`);
+        const url = await uploadToArchive(frameBuffer, `labdesk-thumb-${msgId}`);
+        if (url) {
+          console.log(`🖼️ [THUMB] Archive.org upload OK msgId=${msgId}: ${url}`);
+        } else {
+          console.error(`❌ [THUMB] Archive.org se URL nahi mila, msgId=${msgId}`);
+        }
+        result = url || null;
       }
-      return url || null;
     } catch (e) {
       console.error(`❌ [THUMB] Upload fail hui msgId=${msgId}:`, e.response ? e.response.data : e.message);
-      return null;
     } finally {
       // Safety cleanup - agar ye thumb kabhi consume nahi hua (e.g. notes/dpp
       // message jiske liye thumb ki zaroorat hi nahi thi), map mein hamesha
       // ke liye na pada rahe.
       setTimeout(() => thumbPromises.delete(msgId), 5 * 60 * 1000);
     }
-  })();
-  thumbPromises.set(msgId, promise);
+    resolvePromise(result);
+  });
 }
 
 // Fire-and-forget pre-warm: resolve the source message ahead of time so
