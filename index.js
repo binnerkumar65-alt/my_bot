@@ -161,7 +161,7 @@ async function processQueue() {
 }
 
 // -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE (SAFE WAIT)
+// SCREENSHOT BOT PIPELINE
 // -------------------------------------------------------------
 let latestScreenshotPhoto = null;
 
@@ -171,11 +171,11 @@ async function getThumbViaScreenshotBot(streamLink) {
   try {
     latestScreenshotPhoto = null;
 
-    // Direct Stream URL send kar rahe hain
+    // Send Direct Stream Link
     await client.sendMessage(screenshotEntity, { message: streamLink });
     console.log(`📤 [THUMB-BOT] @screenshort17_bot ko URL bhej diya: ${streamLink}`);
 
-    // Maximum 90 seconds wait
+    // Wait max 90s for response
     let waitCount = 0;
     while (!latestScreenshotPhoto && waitCount < 90) {
       await sleep(1000);
@@ -192,7 +192,7 @@ async function getThumbViaScreenshotBot(streamLink) {
     latestScreenshotPhoto = null;
 
     if (buffer && buffer.length) {
-      console.log(`✅ [THUMB-BOT] Thumbnail image successfully download ho gayi!`);
+      console.log(`✅ [THUMB-BOT] Thumbnail image download ho gayi!`);
       return buffer;
     }
     return null;
@@ -203,7 +203,7 @@ async function getThumbViaScreenshotBot(streamLink) {
 }
 
 // -------------------------------------------------------------
-// ARCHIVE UPLOAD WITH ACCESS-DENIED FIX
+// ARCHIVE UPLOAD
 // -------------------------------------------------------------
 async function uploadToArchive(buffer, idPrefix) {
   if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
@@ -263,7 +263,7 @@ function startThumbUpload(msgId, streamLink) {
 // -------------------------------------------------------------
 // EXPRESS ROUTE
 // -------------------------------------------------------------
-app.get("/", (req, res) => res.send("Bot Active & Archive Auth Fixed"));
+app.get("/", (req, res) => res.send("Bot Active & Pipeline Ready"));
 
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -312,7 +312,7 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH
+// FIREBASE PUSH (SAFE & SANITIZED)
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return false;
@@ -332,8 +332,9 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     else subjectName = seg;
   }
 
-  const subjectKey = subjectName.replace(/[.$#\[\]/]/g, "_");
-  const chapterKey = chapterName.replace(/[.$#\[\]/]/g, "_");
+  // Firebase Node Key Cleanup
+  const subjectKey = subjectName.trim().replace(/[.$#\[\]/]/g, "_");
+  const chapterKey = chapterName.trim().replace(/[.$#\[\]/]/g, "_");
 
   const dataPayload = {
     content_type: contentType,
@@ -362,12 +363,15 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     }
   }
 
+  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(subjectKey)}/${encodeURIComponent(chapterKey)}.json`;
+  console.log(`🚀 [FIREBASE] Pushing to URL: ${pushUrl}`);
+
   try {
-    const res = await axios.post(`${FIREBASE_BASE_URL}/${subjectKey}/${chapterKey}.json`, dataPayload);
+    const res = await axios.post(pushUrl, dataPayload);
     console.log(`🔥 [FIREBASE SUCCESS] Data saved successfully! Key: ${res.data?.name}`);
     return true;
   } catch (e) {
-    console.error("❌ [FIREBASE ERROR]:", e.response?.data || e.message);
+    console.error("❌ [FIREBASE ERROR DETAILS]:", e.response?.status, e.response?.data || e.message);
     return true;
   }
 }
@@ -440,7 +444,7 @@ async function startServer() {
     screenshotBotId = screenshotEntity.id.toString();
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    console.log("🤖 Client Ready! Full Pipeline Active.");
+    console.log("🤖 Client Ready! Complete System Synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
