@@ -110,8 +110,12 @@ let tagMsgCount = 0;
 
 async function loadTagMsgCount() {
   try {
-    const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`);
-    tagMsgCount = typeof res.data === "number" ? res.data : 0;
+    const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`);
+    if (res.data && typeof res.data === "object" && typeof res.data.tagMsgCount === "number") {
+      tagMsgCount = res.data.tagMsgCount;
+    } else {
+      tagMsgCount = 0;
+    }
     console.log(`🔢 [RULE-REMINDER] Counter Firebase se load hua: ${tagMsgCount}`);
   } catch (e) {
     console.error("❌ [RULE-REMINDER] Counter load error:", e.message);
@@ -120,9 +124,8 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
-  // सीधा नंबर भेजें ताकि Firebase में JSON फॉर्मेट की गड़बड़ी न हो
   axios
-    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, tagMsgCount)
+    .patch(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
     .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
@@ -524,7 +527,7 @@ async function handleIncomingMessage(event) {
         startThumbUpload(message.id, streamLink);
       } else if (message.media && message.media.document) {
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
-        forwardDocToTypeChecker(message.id);
+        forwardDocTypeChecker(message.id);
       }
 
       const fallbackText = isVideoMessage(message)
