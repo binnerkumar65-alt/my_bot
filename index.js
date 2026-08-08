@@ -8,7 +8,7 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { NewMessage, EditedMessage } = require("telegram/events");
+const { NewMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 const bigInt = require("big-integer");
@@ -314,7 +314,10 @@ app.get("/stream/:msgId", async (req, res) => {
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return false;
-  if (["सोच...", "thinking..."].some((ig) => replyText.toLowerCase().includes(ig))) return false;
+  if (["सोच...", "thinking..."].some((ig) => replyText.toLowerCase().includes(ig))) {
+    console.log(`⏳ [FIREBASE] AI abhi soch raha hai ("${replyText}") - skip kar rahe hain, edit ka wait...`);
+    return false;
+  }
 
   console.log(`📝 [FIREBASE] ChatGPT Reply Received: "${replyText.substring(0, 50)}..."`);
 
@@ -450,11 +453,26 @@ async function startServer() {
     console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    // YE LINE MISSING THI - ChatGPT bot pehle "सोच..." bhejta hai (NewMessage),
-    // fir USI message ko EDIT karke asli tags/answer daalta hai. Bina is
-    // listener ke, wo asli jawab kabhi detect hi nahi hota tha aur
-    // Firebase mein data push hi nahi ho pata tha.
-    client.addEventHandler(handleIncomingMessage, new EditedMessage({}));
+
+    // YE HISSA CRITICAL HAI - ChatGPT bot pehle "सोच..." bhejta hai
+    // (NewMessage se pakda jaata hai), fir USI message ko EDIT karke asli
+    // tags/answer daalta hai. `EditedMessage` event class is gramjs version
+    // mein reliably fire nahi ho raha tha, isliye raw update ko seedha check
+    // kar rahe hain - ye approach pehle confirm working thi.
+    client.addEventHandler(async (update) => {
+      try {
+        if (
+          update.className === "UpdateEditMessage" ||
+          update.className === "UpdateEditChannelMessage"
+        ) {
+          console.log("✏️ Raw Edit Update Detect Hua, process kar rahe hain...");
+          await handleIncomingMessage({ message: update.message });
+        }
+      } catch (e) {
+        console.error("❌ Raw Edit Handler Error:", e.message);
+      }
+    });
+
     console.log("🤖 Client Ready! Detection pipeline synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
