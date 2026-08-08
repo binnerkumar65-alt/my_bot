@@ -229,15 +229,19 @@ function startThumbUpload(msgId, streamLink) {
   (async () => {
     let result = null;
     try {
+      console.log(`⏳ [ARCHIVE] Uploading thumb for msgId=${msgId}...`);
       const buffer = await getThumbViaScreenshotBot(streamLink);
       if (buffer) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
+        console.log(`🔗 [ARCHIVE] Upload success for msgId=${msgId}: ${result}`);
+      } else {
+        console.error(`❌ [ARCHIVE] Buffer missing for msgId=${msgId}`);
       }
     } catch (e) {
       console.error("❌ Thumb Upload Error:", e.message);
     } finally {
-      resolvePromise(result);
-      setTimeout(() => thumbPromises.delete(msgId), 30000);
+      resolvePromise(result); // Resolves URL (No Timeout)
+      setTimeout(() => thumbPromises.delete(msgId), 10 * 60 * 1000);
       clearMemory();
     }
   })();
@@ -246,7 +250,7 @@ function startThumbUpload(msgId, streamLink) {
 // -------------------------------------------------------------
 // EXPRESS ROUTE
 // -------------------------------------------------------------
-app.get("/", (req, res) => res.send("Bot Active - Infinite Photo Wait Mode Enabled"));
+app.get("/", (req, res) => res.send("Bot Active - Infinite Photo Wait & Full Sync Mode Enabled"));
 
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -295,7 +299,7 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH
+// FIREBASE PUSH (NO TIMEOUT WAIT FOR THUMB_LINK)
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return false;
@@ -327,15 +331,23 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (mediaInfo && mediaInfo.stream_link) {
     dataPayload["stream_link"] = mediaInfo.stream_link;
     if (mediaInfo.msg_id && thumbPromises.has(mediaInfo.msg_id)) {
-      // Direct Photo promise resolved hona chahiye (without timeout)
+      console.log(`⏳ [FIREBASE] msgId=${mediaInfo.msg_id} ke Archive Link aane tak INTIZAR chal raha hai...`);
+      
+      // BINA TIMEOUT KE WAIT: Jab tak thumbUrl mil nahi jata, aage nahi badhega
       const thumbUrl = await thumbPromises.get(mediaInfo.msg_id);
-      if (thumbUrl) dataPayload["thumb_link"] = thumbUrl;
+      
+      if (thumbUrl) {
+        dataPayload["thumb_link"] = thumbUrl;
+        console.log(`✅ [FIREBASE] Firebase payload me thumb_link add ho gaya: ${thumbUrl}`);
+      } else {
+        console.log(`⚠️ [FIREBASE] msgId=${mediaInfo.msg_id} ke liye thumb_link NULL mila.`);
+      }
     }
   }
 
   try {
     await axios.post(`${FIREBASE_BASE_URL}/${subjectKey}/${chapterKey}.json`, dataPayload);
-    console.log(`🔥 Firebase me save ho gaya!`);
+    console.log(`🔥 Firebase me successfully save ho gaya!`);
     return true;
   } catch (e) {
     return true;
@@ -410,7 +422,7 @@ async function startServer() {
     screenshotBotId = screenshotEntity.id.toString();
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    console.log("🤖 Client Ready! Infinite Wait for @screenshort17_bot Active.");
+    console.log("🤖 Client Ready! Infinite Wait Mode Active.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
