@@ -153,6 +153,177 @@ async function processQueue() {
 }
 
 // -------------------------------------------------------------
+// MANUAL VIDEO QUALITY (Low / Medium / HD) - person ko manually kam ya
+// zyada quality chunne ka control chahiye tha. HD = seedha original
+// Telegram file (jaisa pehle se chal raha tha, koi transcode nahi).
+// Low/Medium ek baar ffmpeg se chhoti resolution/bitrate mein transcode
+// karke disk pe cache ho jaate hain - taaki usi video ko dubara us
+// quality par kholne par turant (bina dobara transcode kiye) mil jaaye.
+// -------------------------------------------------------------
+const QUALITY_PRESETS = {
+  low: { height: 360, videoBitrate: "500k", audioBitrate: "64k" },
+  medium: { height: 480, videoBitrate: "900k", audioBitrate: "96k" },
+};
+// Render ke free tier par bahut badi file transcode karna disk/time ke
+// hisaab se risky hai - itni badi file ke liye seedha HD original bhej do.
+const MAX_TRANSCODE_SOURCE_BYTES = 600 * 1024 * 1024; // 600MB
+
+// jobKey (`${msgId}_${quality}`) -> in-flight Promise<string|null>, taaki
+// ek hi video/quality ke liye do requests ek saath aayein to dono ek hi
+// transcode job share karein, do baar kaam na ho.
+const transcodeJobs = new Map();
+
+function transcodedFilePath(msgId, quality) {
+  return path.join(os.tmpdir(), `transcoded_${msgId}_${quality}.mp4`);
+}
+
+// Poori video Telegram se local disk par utaaro (chunk-by-chunk likhte
+// hue, poori cheez RAM mein ek saath nahi rakhte) - ffmpeg ko faststart
+// output banane ke liye ek seekable local input chahiye.
+async function downloadFullFile(message, destPath) {
+  const writeStream = fs.createWriteStream(destPath);
+  const stream = client.iterDownload({ file: message.media, offset: bigInt(0) });
+  try {
+    for await (const chunk of stream) {
+      if (!writeStream.write(chunk)) {
+        await new Promise((resolve) => writeStream.once("drain", resolve));
+      }
+    }
+  } finally {
+    await new Promise((resolve, reject) => {
+      writeStream.end((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+function runFfmpegTranscode(srcPath, destPath, preset) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-y",
+      "-i", srcPath,
+      "-vf", `scale=-2:${preset.height}`,
+      "-c:v", "libx264",
+      "-preset", "veryfast",
+      "-b:v", preset.videoBitrate,
+      "-maxrate", preset.videoBitrate,
+      "-bufsize", `${parseInt(preset.videoBitrate, 10) * 2}k`,
+      "-c:a", "aac",
+      "-b:a", preset.audioBitrate,
+      "-movflags", "+faststart",
+      destPath,
+    ];
+    const proc = spawn(ffmpegPath, args);
+    let stderr = "";
+    proc.stderr.on("data", (d) => (stderr += d.toString()));
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg transcode exited ${code}: ${stderr.slice(-500)}`));
+    });
+  });
+}
+
+// Disk pe pehle se transcoded file ho to seedha wahi return karo. Nahi ho
+// to ek hi baar (dedup ke saath) download+transcode karo aur cache kar do.
+async function ensureTranscoded(message, msgId, quality) {
+  const preset = QUALITY_PRESETS[quality];
+  if (!preset) return null;
+
+  const doc = message.media && message.media.document;
+  const fileSize = doc ? Number(doc.size) || 0 : 0;
+  if (fileSize && fileSize > MAX_TRANSCODE_SOURCE_BYTES) {
+    console.log(`⚠️ [QUALITY] msgId=${msgId} file bahut badi hai (${fileSize} bytes) - HD original bhej rahe hain.`);
+    return null;
+  }
+
+  const destPath = transcodedFilePath(msgId, quality);
+  if (fs.existsSync(destPath)) return destPath;
+
+  const jobKey = `${msgId}_${quality}`;
+  if (transcodeJobs.has(jobKey)) return transcodeJobs.get(jobKey);
+
+  const job = (async () => {
+    const srcPath = path.join(os.tmpdir(), `transcodesrc_${msgId}_${Date.now()}.mp4`);
+    try {
+      console.log(`🎚️ [QUALITY] "${quality}" transcode shuru ho raha hai msgId=${msgId}`);
+      await downloadFullFile(message, srcPath);
+      await runFfmpegTranscode(srcPath, destPath, preset);
+      console.log(`✅ [QUALITY] "${quality}" transcode ban gaya msgId=${msgId}`);
+      return destPath;
+    } catch (e) {
+      console.error(`❌ [QUALITY] Transcode fail hui msgId=${msgId} quality=${quality}:`, e.message);
+      fs.promises.unlink(destPath).catch(() => {});
+      return null;
+    } finally {
+      fs.promises.unlink(srcPath).catch(() => {});
+      transcodeJobs.delete(jobKey);
+    }
+  })();
+
+  transcodeJobs.set(jobKey, job);
+  return job;
+}
+
+// Local (already-transcoded) file ko Range support ke saath serve karo -
+// bilkul original /stream route jaisa behaviour, seeking bhi kaam karta hai.
+function serveLocalFile(filePath, req, res) {
+  return new Promise((resolve) => {
+    fs.stat(filePath, (err, stats) => {
+      if (err) {
+        if (!res.headersSent) res.status(500).send("Quality file error");
+        return resolve();
+      }
+      const fileSize = stats.size;
+      const range = req.headers.range;
+      if (range) {
+        const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(startStr, 10);
+        const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+        res.writeHead(206, {
+          "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+          "Accept-Ranges": "bytes",
+          "Content-Length": end - start + 1,
+          "Content-Type": "video/mp4",
+        });
+        fs.createReadStream(filePath, { start, end })
+          .pipe(res)
+          .on("finish", resolve)
+          .on("error", resolve);
+      } else {
+        res.writeHead(200, {
+          "Content-Type": "video/mp4",
+          "Content-Length": fileSize,
+          "Accept-Ranges": "bytes",
+        });
+        fs.createReadStream(filePath).pipe(res).on("finish", resolve).on("error", resolve);
+      }
+    });
+  });
+}
+
+// Bahut purani transcoded cache files ko disk se saaf karte raho, warna
+// Render ke free tier ka seemit disk bhar sakta hai.
+const TRANSCODE_CACHE_MAX_AGE_MS = 3 * 60 * 60 * 1000; // 3 hours
+function cleanupTranscodeCache() {
+  fs.readdir(os.tmpdir(), (err, files) => {
+    if (err) return;
+    const now = Date.now();
+    files
+      .filter((f) => f.startsWith("transcoded_"))
+      .forEach((f) => {
+        const p = path.join(os.tmpdir(), f);
+        fs.stat(p, (statErr, stats) => {
+          if (statErr) return;
+          if (now - stats.mtimeMs > TRANSCODE_CACHE_MAX_AGE_MS) {
+            fs.unlink(p, () => {});
+          }
+        });
+      });
+  });
+}
+setInterval(cleanupTranscodeCache, 30 * 60 * 1000);
+
+// -------------------------------------------------------------
 // THUMBNAIL (ImgBB) - Telegram's embedded preview JPEG was unreliable
 // (missing for a lot of videos -> nothing ever reached ImgBB/Firebase).
 // So instead we pull the ACTUAL video's frame at the ~4-second mark
@@ -271,7 +442,16 @@ function startThumbUpload(message) {
       params.append("key", IMGBB_API_KEY);
       params.append("image", frameBuffer.toString("base64"));
 
-      const res = await axios.post("https://api.imgbb.com/1/upload", params);
+      // ImgBB apni anti-bot layer se Render jaise cloud/datacenter IPs se
+      // aane waale plain axios requests ko block kar deta hai
+      // ("You have been forbidden to use this website.", code 103) - isko
+      // bypass karne ke liye normal browser jaisa User-Agent bhejte hain.
+      const res = await axios.post("https://api.imgbb.com/1/upload", params, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
+      });
       const url = res.data && res.data.data && res.data.data.url;
       if (url) {
         console.log(`🖼️ [THUMB] ImgBB upload OK msgId=${msgId}: ${url}`);
@@ -362,6 +542,18 @@ app.get("/stream/:msgId", async (req, res) => {
 
     if (!message.media) {
       return res.status(404).send("Media not found");
+    }
+
+    // ?q=low ya ?q=medium -> manually chuni gayi chhoti quality. Query
+    // hi nahi hai (ya q=high) -> hamesha jaisa original/HD passthrough.
+    const requestedQuality = req.query.q;
+    if (requestedQuality && QUALITY_PRESETS[requestedQuality]) {
+      const localPath = await ensureTranscoded(message, msgId, requestedQuality);
+      if (localPath) {
+        return await serveLocalFile(localPath, req, res);
+      }
+      console.log(`⚠️ [QUALITY] msgId=${msgId} ke liye "${requestedQuality}" nahi mili - HD original bhej rahe hain.`);
+      // fall through - neeche wala normal HD passthrough chalega
     }
 
     const media = message.media;
@@ -467,7 +659,12 @@ app.post("/thumb-fallback", async (req, res) => {
     params.append("key", IMGBB_API_KEY);
     params.append("image", base64Image);
 
-    const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", params);
+    const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", params, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+    });
     const url = imgbbRes.data && imgbbRes.data.data && imgbbRes.data.data.url;
     if (!url) {
       console.error(`❌ [THUMB-FALLBACK] ImgBB response mein URL nahi mila, entryKey=${entryKey}`);
