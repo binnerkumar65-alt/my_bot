@@ -144,6 +144,7 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     const sLower = seg.toLowerCase();
     if (sLower.startsWith("dpp")) contentType = "@dpp";
     else if (sLower.startsWith("notes")) contentType = "@notes";
+    else if (sLower.startsWith("other")) contentType = "@other";
     else if (sLower.startsWith("lec")) lecTag = "@" + seg;
     else if (/[\u0900-\u097F]/.test(seg)) chapterName = seg;
     else subjectName = seg;
@@ -381,7 +382,7 @@ async function handleIncomingMessage(event) {
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
       startThumbUpload(message.id, streamLink);
       pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
-      enqueueForTagging(message.id, message.text || "Media File"); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
+      enqueueForTagging(message.id, message.message || message.text || "Media File"); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
       return;
     }
 
@@ -391,7 +392,12 @@ async function handleIncomingMessage(event) {
                           (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
-      const replyText = message.text || "";
+      // IMPORTANT: message.message (raw field) use ho raha hai, message.text
+      // (computed getter) NAHI - raw edit-update se aaye message object pe
+      // .text kabhi khaali/galat aa jaata tha, jisse asli tagged reply bhi
+      // "non-tagged" dikhta tha aur Firebase mein kabhi PATCH hi nahi hota tha.
+      const replyText = message.message || message.text || "";
+      console.log(`🔍 [DEBUG] ChatGPT se mila raw text: "${replyText}"`);
       const replyClean = replyText.toLowerCase();
       const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
 
