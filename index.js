@@ -579,7 +579,15 @@ async function handleIncomingMessage(event) {
       // hain, taaki wo phir bhi chapter/subject/lecture pehchan sake.
       // "Media File" sirf tab jab dono (caption + filename) hi na milein.
       const captionText = message.message || message.text || "";
-      const fallbackText = captionText || getDocumentFileName(message) || "Media File";
+      // Documents (notes/dpp/PDF) ke liye FILENAME hamesha priority hai -
+      // caption likha ho tab bhi ignore karo, kyunki filenames zyada
+      // reliably structured hote hain (jaise "समतल_में_गति_08_Concise_notes")
+      // aur caption kabhi missing/messy ho sakta hai. Sirf videos ke liye
+      // caption ko priority di jaati hai (unka filename generally kaam ka
+      // nahi hota).
+      const fallbackText = isVideoMessage(message)
+        ? (captionText || "Media File")
+        : (getDocumentFileName(message) || captionText || "Media File");
       enqueueForTagging(message.id, fallbackText); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
       return;
     }
