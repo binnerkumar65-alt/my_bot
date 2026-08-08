@@ -28,6 +28,7 @@ const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
 const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
+const TYPE_CHECKER_BOT = "@P840bot"; // <--- Notes/DPP Check karne wala bot
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
@@ -46,6 +47,8 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let chatgptBotIdStr = null;
 let chatgptEntity = null;
+let typeCheckerBotIdStr = null;
+let typeCheckerEntity = null;
 let sourceChatIdStr = null;
 let sourceEntity = null;
 let screenshotBotIdStr = null;
@@ -93,35 +96,14 @@ function cleanupTempFiles() {
 setInterval(cleanupTempFiles, 15 * 1000);
 
 // -------------------------------------------------------------
-// CHATGPT TAGGING PIPELINE (enrichment only) - stream_link/thumb_link
-// already push turant ho jaate hain (neeche pushDirectToFirebase se).
-// Ye pipeline sirf ADDITIONAL tags (subject/chapter/content_type/lecture_no)
-// nikaal ke SAME /Uploads/{msgId} entry mein PATCH karta hai - koi naya
-// entry kabhi nahi banata, isliye tags kabhi galat jagah nahi jaate.
-// Matching FIFO order se hoti hai (jis order mein ChatGPT ko bheja gaya,
-// usi order mein uske jawab wapas aate hain).
-// -------------------------------------------------------------
-// -------------------------------------------------------------
-// RULE REMINDER - har 10 tagging-messages ke baad ChatGPT bot ko rules
-// dobara yaad dilaate hain (kyunki lambi conversation mein wo bhoolne
-// lagta hai). Counter Firebase mein persist hota hai taaki Render restart/
-// sleep hone par bhi count na khoye. Reminder ka reply pendingReplyQueue
-// mein kabhi nahi jaata (isReminder flag se), aur neeche event handler
-// mein bhi sirf "@" se SHURU hone waali replies hi asli tag maani jaati
-// hain - isliye reminder ka acknowledgement reply (jisme udaharan ke
-// taur par "@Physics" jaise words ho sakte hain) kabhi galti se kisi
-// asli pending item se match nahi hoga.
+// CHATGPT PROMPT (Only Subject, Chapter & Lecture No.)
 // -------------------------------------------------------------
 const RULE_REMINDER_TEXT = `नियम याद दिला रहा हूँ:
-1. विषय टैग (जैसे: @Physics, @Biology)
+1. विषय टैग (जैसे: @Physics, @Chemistry, @Biology)
 2. अध्याय टैग (जैसे: @समतल में गति)
-3. सामग्री प्रकार टैग:
-   * अगर टेक्स्ट में "Practice Sheet" या "DPP" है ➔ @dpp
-   * अगर टेक्स्ट में स्पष्ट रूप से "Notes" लिखा है ➔ @notes
-   * इन दोनों के अलावा कुछ भी और हो (जैसे Extra Lecture, Video, Test आदि) ➔ @other
-4. लेक्चर नंबर (अगर टेक्स्ट में दिया हो) ➔ @Lec XX
+3. लेक्चर नंबर (अगर टेक्स्ट में दिया हो) ➔ @Lec XX
 
-अगला इनपुट इसी नियम अनुसार टैग करना - सिर्फ tags ke saath reply karna, aur kuch nahi.`;
+ध्यान दें: Notes या DPP की टैगिंग की ज़रूरत नहीं है। सिर्फ Subject, Chapter और Lecture No. ही टैग करें।`;
 
 let tagMsgCount = 0;
 
@@ -137,11 +119,6 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
-  // axios ka default transformRequest sirf plain-object/array data ko hi
-  // JSON.stringify karta hai - ek bare number (jaise 5) usse pass ho jaata
-  // hai, aur http adapter fir usko reject kar deta hai ("Data after
-  // transformation must be a string..."). Isliye number ko khud
-  // JSON.stringify karke bhejna zaroori hai (ban jaata hai string "5").
   axios
     .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta/tagMsgCount.json`, JSON.stringify(tagMsgCount))
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
@@ -150,6 +127,7 @@ function saveTagMsgCount() {
 
 const sendQueue = [];
 const pendingReplyQueue = []; // { msgId }
+const pendingTypeQueue = [];  // { msgId } -> @P840bot ke response ka wait karne ke liye
 let isSending = false;
 
 function enqueueForTagging(msgId, text) {
@@ -159,7 +137,7 @@ function enqueueForTagging(msgId, text) {
   tagMsgCount++;
   if (tagMsgCount >= 10) {
     sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
-    console.log(`🔁 [RULE-REMINDER] 10 messages ho gaye - rules dobara ChatGPT ko bheje jaa rahe hain, counter reset.`);
+    console.log(`🔁 [RULE-REMINDER] 10 messages ho gaye - rules dobara ChatGPT ko bheje jaa rahe hain.`);
     tagMsgCount = 0;
   }
   saveTagMsgCount();
@@ -182,8 +160,6 @@ async function processSendQueue() {
       if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
       await client.sendMessage(chatgptEntity, { message: item.text });
       if (item.isReminder) {
-        // Reminder ka koi msgId nahi hota - isliye pendingReplyQueue mein
-        // kabhi nahi daalte, taaki iska reply kisi asli item se match na ho.
         console.log(`🔁 [RULE-REMINDER] Rules ChatGPT ko bhej diye.`);
       } else {
         pendingReplyQueue.push({ msgId: item.msgId });
@@ -192,61 +168,44 @@ async function processSendQueue() {
     } catch (e) {
       console.error("❌ [TAG-QUEUE] Send error:", e.message);
     }
-    await sleep(1200); // Telegram flood-limit se bachne ke liye halka gap
+    await sleep(1200);
   }
 
   isSending = false;
 }
 
+// -------------------------------------------------------------
+// P840BOT KO DOCUMENT FORWARD KARNA
+// -------------------------------------------------------------
+async function forwardDocToTypeChecker(messageId) {
+  try {
+    if (!typeCheckerEntity) typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
+    if (!sourceEntity) sourceEntity = await client.getEntity(SOURCE_CHAT);
+
+    await client.forwardMessages(typeCheckerEntity, {
+      messages: [messageId],
+      fromPeer: sourceEntity,
+    });
+
+    pendingTypeQueue.push({ msgId: messageId });
+    console.log(`⏩ [TYPE-CHECKER] Document msgId=${messageId} @P840bot ko forward kar diya.`);
+  } catch (e) {
+    console.error("❌ [TYPE-CHECKER] Forwarding Error:", e.message);
+  }
+}
+
+// -------------------------------------------------------------
+// FIREBASE TAG PATCHING
+// -------------------------------------------------------------
 async function patchAiTagsToFirebase(msgId, replyText) {
   const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
 
-  // IMPORTANT: rule ki FIXED ORDER trust karte hain (1=subject, 2=chapter,
-  // 3=content-type, 4=lecture-optional) - koi keyword-guessing nahi karte.
-  // Pehle keyword-matching se galat bug ban raha tha: jab ChatGPT content-type
-  // ke liye "video"/"test"/kuch aur word bhejta tha (jo "dpp"/"notes"/"other"
-  // se match nahi hota), wo word galti se SUBJECT maan liya jaata tha aur
-  // asli subject (jaise "Physics") overwrite ho jaata tha. Ab AI jo bhi
-  // 3rd position pe bole, usko sirf dpp/notes ke against check karte hain -
-  // baaki HAR cheez (video/test/extra lecture/kuch bhi) seedha @other maani
-  // jaati hai, subject/chapter kabhi disturb nahi hote.
   const subjectName = (segments[0] || "General").trim();
   const chapterName = (segments[1] || "General_Lectures").trim();
-  const rawContentSeg = (segments[2] || "").trim();
-  const seg4 = (segments[3] || "").trim();
+  const seg3 = (segments[2] || "").trim();
 
-  const rawLower = rawContentSeg.toLowerCase();
-  let contentType = "@other";
-  if (rawLower.startsWith("dpp")) contentType = "@dpp";
-  else if (rawLower.startsWith("notes")) contentType = "@notes";
-  // baaki kuch bhi ho (video/other/test/extra lecture) - @other hi rahega
-
-  // Lecture number normally 4th position pe hota hai; agar kabhi 3rd position
-  // pe hi "Lec.." aa jaaye (ChatGPT ne content-type skip kar diya ho), tab bhi
-  // pakad lete hain.
   let lecTag = "";
-  if (/^lec/i.test(seg4)) lecTag = "@" + seg4;
-  else if (/^lec/i.test(rawContentSeg)) lecTag = "@" + rawContentSeg;
-
-  // HTML dashboard hamesha /{Subject}/{Chapter}/{msgId} nested path se
-  // padhta hai (subject match 'phys'/'chem'/'bio' se, phir usi subject ke
-  // andar chapter-naam ke node ke andar saari entries - videos + notes +
-  // dpp sab EK hi chapter-object ke andar, content_type field se pehchane
-  // jaate hain). Isliye final entry seedha usi nested path pe likhni hai -
-  // /Uploads/{msgId} pe flat likhna hi "chapters bikhar jaane" wala bug tha,
-  // kyunki HTML us path ko kabhi padhta hi nahi.
-  const lecNum = lecTag.replace(/^@?Lec\s*/i, "").trim();
-  const displayTitle = lecNum ? `${chapterName} — Lecture ${lecNum}` : chapterName;
-
-  // Thumbnail alag se, background mein (screenshot-bot pipeline se) taiyar
-  // ho rahi hoti hai - tags se pehle ya baad mein, kabhi bhi aa sakti hai.
-  // Yahan wait kar lete hain taaki final (nested) entry mein thumb_link
-  // kabhi chhoote na - warna Pending record delete hone ke baad thumb_link
-  // hamesha ke liye kho jaata.
-  let thumbUrl = null;
-  if (thumbPromises.has(msgId)) {
-    thumbUrl = await thumbPromises.get(msgId);
-  }
+  if (/^lec/i.test(seg3)) lecTag = "@" + seg3;
 
   const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
   let staged = {};
@@ -257,11 +216,20 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     console.error("❌ [FIREBASE] Pending entry read error:", e.response?.data || e.message);
   }
 
+  // Agar @P840bot ne content_type abhi tak update nahi kiya ho to default `@other` rakho
+  const contentType = staged.content_type || "@other";
+
+  let thumbUrl = null;
+  if (thumbPromises.has(msgId)) {
+    thumbUrl = await thumbPromises.get(msgId);
+  }
+
+  const lecNum = lecTag.replace(/^@?Lec\s*/i, "").trim();
+  const displayTitle = lecNum ? `${chapterName} — Lecture ${lecNum}` : chapterName;
+
   const finalPayload = {
     msg_id: msgId,
     stream_link: staged.stream_link || `${RENDER_URL}/stream/${msgId}`,
-    // Notes/DPP files ke liye HTML seedha download_link use karta hai
-    // (file-row href) - stream_link video-player ke liye hai, files ke liye nahi.
     download_link: (contentType === "@notes" || contentType === "@dpp")
       ? `${RENDER_URL}/download/${msgId}`
       : "",
@@ -280,7 +248,7 @@ async function patchAiTagsToFirebase(msgId, replyText) {
   try {
     await axios.put(finalUrl, finalPayload);
     console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
-    axios.delete(pendingUrl).catch(() => {}); // ab staging entry ki zaroorat nahi
+    axios.delete(pendingUrl).catch(() => {});
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
@@ -365,9 +333,6 @@ function getDocumentFileName(message) {
   if (!doc || !doc.attributes) return null;
   const nameAttr = doc.attributes.find((a) => a.className === "DocumentAttributeFilename");
   if (!nameAttr || !nameAttr.fileName) return null;
-  // Filenames aksar underscore se bhare hote hain (jaise "समतल_में_गति_08_...")
-  // - ChatGPT ko bhejne se pehle readable bana dete hain taaki chapter/lecture
-  // sahi tag ho.
   return nameAttr.fileName.replace(/\.[a-zA-Z0-9]+$/, "").replace(/_/g, " ").trim();
 }
 
@@ -404,9 +369,9 @@ function startThumbUpload(msgId, streamLink) {
 }
 
 // -------------------------------------------------------------
-// EXPRESS ROUTE
+// EXPRESS ROUTES
 // -------------------------------------------------------------
-app.get("/", (req, res) => res.send("Bot Active - ChatGPT Detection Fixed"));
+app.get("/", (req, res) => res.send("Bot Active - ChatGPT & TypeChecker Pipeline Integrated"));
 
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -454,14 +419,6 @@ app.get("/stream/:msgId", async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// DIRECT DOWNLOAD ROUTE - notes/dpp (PDFs, images, etc) ke liye. /stream
-// route hamesha "video/mp4" bhejta hai aur browser mein inline khulta/
-// buffer karta hai, jo files ke liye galat hai. Ye route asli mimeType +
-// filename Telegram document se nikaal ke Content-Disposition: attachment
-// bhejta hai, taaki click karte hi seedha device pe download ho, koi
-// viewer na khule.
-// -------------------------------------------------------------
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -501,14 +458,7 @@ app.get("/download/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE STAGING PUSH - jab tak ChatGPT se subject/chapter tags nahi aa
-// jaate, humein pata hi nahi hota entry final nested path
-// (/{Subject}/{Chapter}/{msgId}) pe kahan jaayegi. Isliye stream_link
-// (aur baad mein thumb_link) turant sirf ek temporary /Pending/{msgId}
-// record mein save hote hain. Jaise hi tags aate hain, patchAiTagsToFirebase
-// isi Pending record ko padh kar sahi chapter ke andar FINAL likh deta hai
-// aur Pending record delete kar deta hai - isliye ab koi bhi entry kabhi
-// root mein akeli/bikhri hui flat nahi padi rahti.
+// FIREBASE PUSH (STAGING / PENDING)
 // -------------------------------------------------------------
 async function pushDirectToFirebase(msgId, streamLink) {
   const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
@@ -516,32 +466,27 @@ async function pushDirectToFirebase(msgId, streamLink) {
   const dataPayload = {
     msg_id: msgId,
     stream_link: streamLink,
+    status: "pending",
     timestamp: { ".sv": "timestamp" },
   };
 
   try {
-    await axios.put(pendingUrl, dataPayload); // PUT - msgId hi key hai, taaki thumb_link baad mein isi path pe PATCH ho sake
-    console.log(`🔥 [FIREBASE] stream_link Pending mein push ho gaya (msgId=${msgId})`);
+    await axios.put(pendingUrl, dataPayload);
+    console.log(`🔥 [FIREBASE] Data Pending state mein push ho gaya (msgId=${msgId})`);
   } catch (e) {
-    console.error("❌ [FIREBASE] stream_link push error:", e.response?.data || e.message);
+    console.error("❌ [FIREBASE] Pending push error:", e.response?.data || e.message);
     return;
   }
 
-  // Thumbnail background mein already ban rahi hai (startThumbUpload se) -
-  // jab wo ready ho jaaye, Pending record mein thumb_link add (PATCH) kar do,
-  // taaki patchAiTagsToFirebase ko final entry banate waqt mil jaaye.
   if (thumbPromises.has(msgId)) {
-    console.log(`⏳ [FIREBASE] msgId=${msgId} ke thumbnail ka wait ho raha hai...`);
     const thumbUrl = await thumbPromises.get(msgId);
     if (thumbUrl) {
       try {
         await axios.patch(pendingUrl, { thumb_link: thumbUrl });
-        console.log(`✅ [FIREBASE] thumb_link Pending mein add ho gaya (msgId=${msgId}): ${thumbUrl}`);
+        console.log(`✅ [FIREBASE] thumb_link Pending mein patch हुआ (msgId=${msgId})`);
       } catch (e) {
-        console.error("❌ [FIREBASE] thumb_link patch error:", e.response?.data || e.message);
+        console.error("❌ [FIREBASE] thumb_link patch error:", e.message);
       }
-    } else {
-      console.log(`⚠️ [FIREBASE] msgId=${msgId} ke liye thumbnail nahi mil paayi, stream_link phir bhi Pending mein hai.`);
     }
   }
 }
@@ -563,76 +508,82 @@ async function handleIncomingMessage(event) {
 
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    // 1. Source Channel Message - stream_link turant push hota hai, aur
-    // saath hi ChatGPT ko tagging ke liye bhi bhej dete hain (enrichment).
+    // 1. Source Channel Message Processing
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message आया ID=${message.id}`);
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
-      if (isVideoMessage(message)) {
-        startThumbUpload(message.id, streamLink); // sirf video ke liye - screenshot-bot ko forward hota hai
-      } else {
-        console.log(`📄 [THUMB] msgId=${message.id} document hai (video nahi) - screenshot-bot ko forward NAHI karenge.`);
-      }
-      pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
-      // Caption khaali ho sakta hai (jaise sirf ek PDF bina text ke forward
-      // hui ho) - us case mein document ka FILENAME hi ChatGPT ko bhejte
-      // hain, taaki wo phir bhi chapter/subject/lecture pehchan sake.
-      // "Media File" sirf tab jab dono (caption + filename) hi na milein.
+      
+      // Firebase mein instant pending push
+      pushDirectToFirebase(message.id, streamLink);
+
       const captionText = message.message || message.text || "";
-      // Documents (notes/dpp/PDF) ke liye FILENAME hamesha priority hai -
-      // caption likha ho tab bhi ignore karo, kyunki filenames zyada
-      // reliably structured hote hain (jaise "समतल_में_गति_08_Concise_notes")
-      // aur caption kabhi missing/messy ho sakta hai. Sirf videos ke liye
-      // caption ko priority di jaati hai (unka filename generally kaam ka
-      // nahi hota).
+
+      if (isVideoMessage(message)) {
+        startThumbUpload(message.id, streamLink);
+      } else if (message.media && message.media.document) {
+        // DOCUMENT AAYA HAI: @P840bot ko type detection ke liye forward karo
+        console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
+        forwardDocToTypeChecker(message.id);
+      }
+
       const fallbackText = isVideoMessage(message)
         ? (captionText || "Media File")
         : (getDocumentFileName(message) || captionText || "Media File");
-      enqueueForTagging(message.id, fallbackText); // fire-and-forget - jawab aane par isi msgId mein tags PATCH honge
+      
+      enqueueForTagging(message.id, fallbackText);
       return;
     }
 
-    // 2. ChatGPT Bot Reply - sirf TAGS nikaal ke same /Uploads/{msgId}
-    // entry mein PATCH karta hai, koi naya entry nahi banata.
+    // 2. Reply from @P840bot (Notes vs DPP Type Checker)
+    const isFromTypeChecker = (typeCheckerBotIdStr && senderIdSync === typeCheckerBotIdStr) ||
+                              (typeCheckerBotIdStr && chatIdStr.includes(typeCheckerBotIdStr));
+
+    if (isFromTypeChecker) {
+      const replyText = message.message || message.text || "";
+      console.log(`🤖 [@P840bot Response]: "${replyText}"`);
+
+      let detectedType = "@other";
+      if (replyText.includes("@dpp")) detectedType = "@dpp";
+      else if (replyText.includes("@notes")) detectedType = "@notes";
+
+      const matched = pendingTypeQueue.shift();
+      if (matched) {
+        console.log(`📝 [TYPE-CHECKER] msgId=${matched.msgId} ka type "${detectedType}" mil gaya.`);
+        const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
+        try {
+          await axios.patch(pendingUrl, { 
+            content_type: detectedType,
+            download_link: `${RENDER_URL}/download/${matched.msgId}` 
+          });
+        } catch (e) {
+          console.error("❌ Type Patch Error:", e.message);
+        }
+      }
+      return;
+    }
+
+    // 3. ChatGPT Bot Reply (Subject & Chapter Identification)
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
                           (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
-      // IMPORTANT: message.message (raw field) use ho raha hai, message.text
-      // (computed getter) NAHI - raw edit-update se aaye message object pe
-      // .text kabhi khaali/galat aa jaata tha, jisse asli tagged reply bhi
-      // "non-tagged" dikhta tha aur Firebase mein kabhi PATCH hi nahi hota tha.
       const replyText = message.message || message.text || "";
-      console.log(`🔍 [DEBUG] ChatGPT se mila raw text: "${replyText}"`);
       const replyClean = replyText.toLowerCase();
       const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
 
-      if (isThinking) {
-        console.log(`⏳ AI abhi soch raha hai ("${replyText}") - pending queue ko chhedte nahi, edit ka wait.`);
-        return;
-      }
+      if (isThinking) return;
 
-      if (!replyText.trim().startsWith("@")) {
-        // Ya to non-tagged reply hai, ya RULE_REMINDER ka acknowledgement
-        // (jisme udaharan ke taur par beech mein "@Physics" jaisa text ho
-        // sakta hai, isliye sirf "@" se SHURU hone waali reply ko hi asli
-        // tag maanna zaroori hai). Dono cases mein koi pending item consume
-        // nahi karte.
-        console.log("ℹ️ Non-tagged (ya reminder ka) reply aayi - koi pending item consume nahi karenge.");
-        return;
-      }
+      if (!replyText.trim().startsWith("@")) return;
 
       const matched = pendingReplyQueue.shift();
       if (matched) {
         console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
         await patchAiTagsToFirebase(matched.msgId, replyText);
-      } else {
-        console.log("⚠️ ChatGPT reply aayi lekin koi pending item match karne ke liye nahi mila.");
       }
       return;
     }
 
-    // 3. New Screenshot Bot Reply (@screenshort17_bot)
+    // 4. Screenshot Bot Reply (@screenshort17_bot)
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
@@ -653,7 +604,6 @@ async function handleIncomingMessage(event) {
 async function startServer() {
   app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
 
-  console.log("🧹 [INIT] Memory aur temp files saaf kar rahe hain...");
   clearMemory();
   cleanupTempFiles();
 
@@ -663,6 +613,9 @@ async function startServer() {
     chatgptEntity = await client.getEntity(CHATGPT_BOT);
     chatgptBotIdStr = chatgptEntity.id.toString();
 
+    typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
+    typeCheckerBotIdStr = typeCheckerEntity.id.toString();
+
     sourceEntity = await client.getEntity(SOURCE_CHAT);
     sourceChatIdStr = sourceEntity.id.toString();
 
@@ -671,20 +624,16 @@ async function startServer() {
 
     await loadTagMsgCount();
 
-    console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
+    console.log(`📌 Entities Loaded: ChatGPT=${chatgptBotIdStr} | TypeChecker=${typeCheckerBotIdStr} | Source=${sourceChatIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
 
-    // ChatGPT bot pehle "सोच..." bhejta hai (NewMessage se pakda jaata hai),
-    // fir USI message ko EDIT karke asli tags daalta hai - is raw update
-    // handler ke bina wo asli jawab kabhi detect hi nahi hoga.
     client.addEventHandler(async (update) => {
       try {
         if (
           update.className === "UpdateEditMessage" ||
           update.className === "UpdateEditChannelMessage"
         ) {
-          console.log("✏️ Raw Edit Update Detect Hua, process kar rahe hain...");
           await handleIncomingMessage({ message: update.message });
         }
       } catch (e) {
@@ -692,7 +641,7 @@ async function startServer() {
       }
     });
 
-    console.log("🤖 Client Ready! Detection pipeline synchronized.");
+    console.log("🤖 Client Ready! Entire Workflow Synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
