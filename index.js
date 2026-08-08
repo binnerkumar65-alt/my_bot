@@ -27,7 +27,6 @@ const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
 const SOURCE_CHAT = "@sxhckfufig";
-const CHATGPT_BOT = "@chatgpt";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
@@ -44,8 +43,6 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
-let chatgptBotIdStr = null;
-let chatgptEntity = null;
 let sourceChatIdStr = null;
 let sourceEntity = null;
 let screenshotBotIdStr = null;
@@ -91,54 +88,6 @@ function cleanupTempFiles() {
   });
 }
 setInterval(cleanupTempFiles, 15 * 1000);
-
-// -------------------------------------------------------------
-// PIPELINE QUEUE (no waiting) - har forward turant ChatGPT ko chala jaata
-// hai, agle ka wait kiye bina. Har item ki apni pehchan (msgId) "pending
-// replies" list mein FIFO order mein lag jaati hai - jab bhi ChatGPT ka
-// asli (tagged) jawab aata hai, wo hamesha sabse pehle wale pending item
-// se match hota hai, taaki data hamesha sahi jagah (sahi lecture/notes/dpp
-// entry) mein jaaye, chahe kitne bhi messages ek saath bheje gaye ho.
-// -------------------------------------------------------------
-const sendQueue = [];           // abhi tak ChatGPT ko bheje nahi gaye
-const pendingReplyQueue = [];   // bhej diye gaye, reply ka wait hai (FIFO)
-let isSending = false;
-
-function enqueueSourceMessage(item) {
-  sendQueue.push(item);
-  console.log(`📥 [QUEUE] Add hua ID=${item.msgId} | bhejne ko baaki: ${sendQueue.length}`);
-  if (!isSending) {
-    processSendQueue().catch((e) => {
-      console.error("❌ [QUEUE] processSendQueue error:", e);
-      isSending = false;
-    });
-  }
-}
-
-async function processSendQueue() {
-  if (isSending) return;
-  isSending = true;
-
-  while (sendQueue.length > 0) {
-    const item = sendQueue.shift();
-    try {
-      if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
-      await client.sendMessage(chatgptEntity, { message: item.text });
-
-      // Reply ka wait kiye BINA turant agle item pe badh jaayenge - ye
-      // item apni ID (msgId) ke saath pending list ke aakhir mein lag
-      // jaata hai, jawab aane par yahi se uthaya jayega (FIFO).
-      pendingReplyQueue.push({ msgId: item.msgId, streamLink: item.streamLink });
-      console.log(`📨 [QUEUE] ChatGPT ko bhej diya ID=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
-    } catch (e) {
-      console.error("❌ [QUEUE] ChatGPT Send Error:", e.message);
-    }
-
-    await sleep(1200); // Telegram flood-limit se bachne ke liye halka sa gap
-  }
-
-  isSending = false;
-}
 
 // -------------------------------------------------------------
 // SCREENSHOT BOT PIPELINE
@@ -290,74 +239,47 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH
+// FIREBASE PUSH - AB SEEDHA, AI wala tagging hata diya gaya hai. Sirf
+// stream_link (video) aur thumb_link (archive.org se aayi thumbnail)
+// push hote hain, kisi ChatGPT reply/tag ka koi matlab nahi raha.
 // -------------------------------------------------------------
-async function processReplyAndPushToFirebase(replyText, mediaInfo) {
-  if (!replyText) return false;
-  if (["सोच...", "thinking..."].some((ig) => replyText.toLowerCase().includes(ig))) {
-    console.log(`⏳ [FIREBASE] AI abhi soch raha hai ("${replyText}") - skip kar rahe hain, edit ka wait...`);
-    return false;
-  }
-
-  console.log(`📝 [FIREBASE] ChatGPT Reply Received: "${replyText.substring(0, 50)}..."`);
-
-  const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
-  let contentType = "@other", lecTag = "", subjectName = "General", chapterName = "General_Lectures";
-
-  for (const seg of segments) {
-    const sLower = seg.toLowerCase();
-    if (sLower.startsWith("dpp")) contentType = "@dpp";
-    else if (sLower.startsWith("notes")) contentType = "@notes";
-    else if (sLower.startsWith("lec")) lecTag = "@" + seg;
-    else if (/[\u0900-\u097F]/.test(seg)) chapterName = seg;
-    else subjectName = seg;
-  }
-
-  const subjectKey = subjectName.trim().replace(/[.$#\[\]/]/g, "_");
-  const chapterKey = chapterName.trim().replace(/[.$#\[\]/]/g, "_");
+async function pushDirectToFirebase(msgId, streamLink) {
+  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Uploads/${msgId}.json`;
 
   const dataPayload = {
-    content_type: contentType,
-    lecture_no: lecTag,
-    raw_reply: replyText,
-    display_title: chapterName,
+    msg_id: msgId,
+    stream_link: streamLink,
     timestamp: { ".sv": "timestamp" },
   };
 
-  if (mediaInfo && mediaInfo.stream_link) {
-    dataPayload["stream_link"] = mediaInfo.stream_link;
-    if (mediaInfo.msg_id && thumbPromises.has(mediaInfo.msg_id)) {
-      console.log(`⏳ [FIREBASE] msgId=${mediaInfo.msg_id} ke Archive Link ka wait ho raha hai...`);
-      
-      const thumbUrl = await Promise.race([
-        thumbPromises.get(mediaInfo.msg_id),
-        new Promise((r) => setTimeout(() => r(null), 90000))
-      ]);
-      
-      if (thumbUrl) {
-        dataPayload["thumb_link"] = thumbUrl;
-        console.log(`✅ [FIREBASE] thumb_link add ho gaya: ${thumbUrl}`);
-      } else {
-        console.log(`⚠️ [FIREBASE] msgId=${mediaInfo.msg_id} ka thumb_link nahi mila, direct data push kar rahe hain.`);
-      }
-    }
+  try {
+    await axios.put(pushUrl, dataPayload); // PUT - msgId hi key hai, taaki thumb_link baad mein isi path pe PATCH ho sake
+    console.log(`🔥 [FIREBASE] stream_link push ho gaya (msgId=${msgId})`);
+  } catch (e) {
+    console.error("❌ [FIREBASE] stream_link push error:", e.response?.data || e.message);
+    return;
   }
 
-  const pushUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(subjectKey)}/${encodeURIComponent(chapterKey)}.json`;
-  console.log(`🚀 [FIREBASE] Pushing to URL: ${pushUrl}`);
-
-  try {
-    const res = await axios.post(pushUrl, dataPayload);
-    console.log(`🔥 [FIREBASE SUCCESS] Data saved successfully! Key: ${res.data?.name}`);
-    return true;
-  } catch (e) {
-    console.error("❌ [FIREBASE ERROR DETAILS]:", e.response?.status, e.response?.data || e.message);
-    return true;
+  // Thumbnail background mein already ban rahi hai (startThumbUpload se) -
+  // jab wo ready ho jaaye, usi entry mein thumb_link add (PATCH) kar do.
+  if (thumbPromises.has(msgId)) {
+    console.log(`⏳ [FIREBASE] msgId=${msgId} ke thumbnail ka wait ho raha hai...`);
+    const thumbUrl = await thumbPromises.get(msgId);
+    if (thumbUrl) {
+      try {
+        await axios.patch(pushUrl, { thumb_link: thumbUrl });
+        console.log(`✅ [FIREBASE] thumb_link add ho gaya (msgId=${msgId}): ${thumbUrl}`);
+      } catch (e) {
+        console.error("❌ [FIREBASE] thumb_link patch error:", e.response?.data || e.message);
+      }
+    } else {
+      console.log(`⚠️ [FIREBASE] msgId=${msgId} ke liye thumbnail nahi mil paayi, stream_link phir bhi save hai.`);
+    }
   }
 }
 
 // -------------------------------------------------------------
-// EVENT HANDLER (FIXED CHATGPT MATCHING)
+// EVENT HANDLER
 // -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
@@ -373,46 +295,17 @@ async function handleIncomingMessage(event) {
 
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    // 1. Source Channel Message
+    // 1. Source Channel Message - ab seedha push, ChatGPT ko kuch bhejna
+    // hi nahi hai.
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message आया ID=${message.id}`);
-      let streamLink = `${RENDER_URL}/stream/${message.id}`;
+      const streamLink = `${RENDER_URL}/stream/${message.id}`;
       startThumbUpload(message.id, streamLink);
-      enqueueSourceMessage({ msgId: message.id, streamLink, text: message.text || "Media File" });
+      pushDirectToFirebase(message.id, streamLink); // fire-and-forget - andar khud thumbnail ka wait karke PATCH karega
       return;
     }
 
-    // 2. ChatGPT Bot Reply (Strict Match via ID & ChatId)
-    const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) || 
-                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
-
-    if (isFromChatGPT) {
-      const replyText = message.text || "";
-      const replyClean = replyText.toLowerCase();
-      const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
-
-      if (isThinking) {
-        console.log(`⏳ AI abhi soch raha hai ("${replyText}") - pending queue ko chhedte nahi, wait continue.`);
-        return;
-      }
-
-      if (!replyText.includes("@")) {
-        console.log("ℹ️ Non-tagged reply aayi - koi pending item consume nahi karenge.");
-        return;
-      }
-
-      // Sabse pehle bheja gaya item hi is jawab ka sahi match hai (FIFO) -
-      // isliye links/tags kabhi mix nahi hote, chahe kitne bhi messages
-      // ek saath ya lagataar bina wait kiye bheje ho.
-      const matched = pendingReplyQueue.shift();
-      console.log(`🤖 ChatGPT ka message detected! Match hua ID=${matched ? matched.msgId : "unknown"} se. Parsing reply...`);
-
-      const mediaInfo = matched ? { stream_link: matched.streamLink, msg_id: matched.msgId } : {};
-      await processReplyAndPushToFirebase(replyText, mediaInfo);
-      return;
-    }
-
-    // 3. New Screenshot Bot Reply (@screenshort17_bot)
+    // 2. New Screenshot Bot Reply (@screenshort17_bot)
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
@@ -440,37 +333,15 @@ async function startServer() {
   try {
     await client.connect();
 
-    chatgptEntity = await client.getEntity(CHATGPT_BOT);
-    chatgptBotIdStr = chatgptEntity.id.toString();
-
     sourceEntity = await client.getEntity(SOURCE_CHAT);
     sourceChatIdStr = sourceEntity.id.toString();
 
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
     screenshotBotIdStr = screenshotEntity.id.toString();
 
-    console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
+    console.log(`📌 Target IDs Loaded - Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-
-    // YE HISSA CRITICAL HAI - ChatGPT bot pehle "सोच..." bhejta hai
-    // (NewMessage se pakda jaata hai), fir USI message ko EDIT karke asli
-    // tags/answer daalta hai. `EditedMessage` event class is gramjs version
-    // mein reliably fire nahi ho raha tha, isliye raw update ko seedha check
-    // kar rahe hain - ye approach pehle confirm working thi.
-    client.addEventHandler(async (update) => {
-      try {
-        if (
-          update.className === "UpdateEditMessage" ||
-          update.className === "UpdateEditChannelMessage"
-        ) {
-          console.log("✏️ Raw Edit Update Detect Hua, process kar rahe hain...");
-          await handleIncomingMessage({ message: update.message });
-        }
-      } catch (e) {
-        console.error("❌ Raw Edit Handler Error:", e.message);
-      }
-    });
 
     console.log("🤖 Client Ready! Detection pipeline synchronized.");
   } catch (e) {
