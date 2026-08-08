@@ -30,6 +30,11 @@ const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
 const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
+// "Screenshot Generator Bot" - video bhej kar "Get Thumbs" click karne par
+// wo video ka ek real thumbnail (photo) reply karta hai. Telegram ke apne
+// embedded thumb se zyada reliable hai (bahut saari videos mein embedded
+// thumb hota hi nahi), isliye ab yahi hamara primary thumbnail source hai.
+const SCREENSHOT_BOT = "@screenshotit_bot";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
 // Internet Archive (archive.org) IAS3 upload API - ImgBB ki jagah, kyunki
@@ -61,6 +66,10 @@ let sourceChatId = null;
 // request doesn't re-fetch it from Telegram, which was adding latency
 // on every single click.
 let sourceEntity = null;
+
+// Resolved once at startup - used for reliable Screenshot-bot reply detection
+let screenshotBotId = null;
+let screenshotEntity = null;
 
 // Small in-memory cache of message objects, keyed by msgId. Populated
 // right after a message arrives (pre-warm), so by the time the HTML
@@ -407,14 +416,129 @@ function withTimeout(promise, ms, timeoutMessage) {
   return guarded;
 }
 
-// Ab video ke bade chunks download karke ffmpeg se frame nikaalne ki
-// koshish NAHI karte - wo hi timeouts ("Telegram se chunk atak gaya") aur
-// OOM crash (har ffmpeg spawn + multi-MB buffer memory khaata hai) dono
-// ki wajah tha. Iski jagah seedha Telegram/Telethon ka apna embedded
-// video-thumbnail (chhoti, kuch KB ki JPEG jo Telegram video ke saath
-// hamesha store karta hai) download karte hain - ek hi halka network call,
-// koi ffmpeg process nahi, koi bada buffer nahi.
+// Sirf video documents ke liye true - notes/DPP/PDF jaise non-video files
+// ke liye thumbnail ki zaroorat hi nahi, unhe Screenshot-bot ko forward
+// karna bhi bekaar hoga.
+function isVideoDocument(message) {
+  const doc = message.media && message.media.document;
+  if (!doc) return false;
+  if (doc.mimeType && doc.mimeType.startsWith("video/")) return true;
+  if (doc.attributes) {
+    return doc.attributes.some((a) => a.className === "DocumentAttributeVideo");
+  }
+  return false;
+}
+
+// -------------------------------------------------------------
+// SCREENSHOT-BOT (@screenshotit_bot) - video ko is bot ko forward karo,
+// wo ek options-menu ke saath reply karta hai, usme "Get Thumbs" button
+// hai (reply-keyboard, isliye "click" karna matlab wahi text bhej dena),
+// aur uske baad wo asli video-frame se bani thumbnail photo bhejta hai.
+// Ye Telegram ke apne embedded-thumb se zyada reliable hai (bahut saari
+// videos mein embedded thumb hota hi nahi).
+//
+// Ek time pe sirf EK reply ka wait ho raha hota hai (thumbQueue pehle se
+// sequential hai - ek waqt sirf ek hi video is pipeline mein hota hai),
+// isliye bot ke replies kabhi mix nahi hote.
+// -------------------------------------------------------------
+const screenshotBotWaiters = []; // { predicate(message) => bool, resolve(message) }
+
+function waitForScreenshotBotMessage(timeoutMs, predicate) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; resolve(null); }
+    }, timeoutMs);
+    screenshotBotWaiters.push({
+      predicate,
+      resolve: (msg) => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(msg); }
+      },
+    });
+  });
+}
+
+// handleIncomingMessage se call hota hai jab bhi Screenshot-bot ka koi
+// naya message aaye - jo bhi sabse pehla matching waiter mile use resolve
+// kar do.
+function handleScreenshotBotMessage(message) {
+  for (let i = 0; i < screenshotBotWaiters.length; i++) {
+    if (screenshotBotWaiters[i].predicate(message)) {
+      const waiter = screenshotBotWaiters.splice(i, 1)[0];
+      waiter.resolve(message);
+      return;
+    }
+  }
+}
+
+const SCREENSHOT_MENU_TIMEOUT_MS = 30000; // bot options-menu bhejne mein itna time le sakta hai
+const SCREENSHOT_PHOTO_TIMEOUT_MS = 90000; // bot ko thumbnail generate karne mein itna time lag sakta hai
+
+async function getThumbViaScreenshotBot(message) {
+  if (!screenshotEntity) {
+    console.log("⚠️ [THUMB-BOT] Screenshot bot resolve nahi hua tha - skip.");
+    return null;
+  }
+  if (!sourceEntity) {
+    console.log("⚠️ [THUMB-BOT] Source entity resolve nahi hua - skip.");
+    return null;
+  }
+
+  try {
+    // 1. Video ko Screenshot-bot ko forward karo
+    await client.forwardMessages(screenshotEntity, {
+      messages: [message.id],
+      fromPeer: sourceEntity,
+    });
+    console.log(`📤 [THUMB-BOT] msgId=${message.id} Screenshot-bot ko forward kiya.`);
+
+    // 2. Bot ke options-menu reply ka wait ("Choose one of the options.")
+    const menuMsg = await waitForScreenshotBotMessage(SCREENSHOT_MENU_TIMEOUT_MS, (m) => {
+      const t = (m.text || m.message || "").toLowerCase();
+      return t.includes("choose one of the options") || t.includes("choose one");
+    });
+    if (!menuMsg) {
+      console.error(`❌ [THUMB-BOT] msgId=${message.id}: options-menu ka reply nahi mila (${SCREENSHOT_MENU_TIMEOUT_MS / 1000}s).`);
+      return null;
+    }
+
+    // 3. "Get Thumbs" button click karo - reply-keyboard hai, isliye
+    // "click" karna matlab seedha wahi text message bhej dena.
+    await client.sendMessage(screenshotEntity, { message: "Get Thumbs" });
+    console.log(`🖱️ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" bheja.`);
+
+    // 4. Thumbnail photo ka wait
+    const photoMsg = await waitForScreenshotBotMessage(SCREENSHOT_PHOTO_TIMEOUT_MS, (m) => !!m.photo);
+    if (!photoMsg) {
+      console.error(`❌ [THUMB-BOT] msgId=${message.id}: thumbnail photo ka reply nahi mila (${SCREENSHOT_PHOTO_TIMEOUT_MS / 1000}s).`);
+      return null;
+    }
+
+    // 5. Photo download karo
+    const buffer = await client.downloadMedia(photoMsg);
+    if (buffer && buffer.length) {
+      console.log(`✅ [THUMB-BOT] msgId=${message.id}: thumbnail photo mil gayi.`);
+      return buffer;
+    }
+    return null;
+  } catch (e) {
+    console.error(`❌ [THUMB-BOT] Error msgId=${message.id}:`, e.message);
+    return null;
+  }
+}
+
+// Primary: Screenshot-bot se real video-frame thumbnail mangwao. Wo fail
+// ho (bot down, timeout, etc.) to Telegram ke apne embedded thumb (agar
+// available ho) pe fallback karo, taaki thumbnail kabhi bhi poori tarah
+// khaali na jaaye.
 async function generateThumbFrame(message) {
+  if (!isVideoDocument(message)) return null;
+
+  const viaBot = await getThumbViaScreenshotBot(message);
+  if (viaBot && viaBot.length) return viaBot;
+
+  console.log(`⚠️ [THUMB] Screenshot-bot se nahi mila msgId=${message.id} - embedded thumb try kar rahe hain.`);
+
   // Kai videos (khaaskar documents/GIFs ki tarah bheji gayi files) mein
   // Telegram apna embedded thumbnail banata hi nahi - aise case mein
   // downloadMedia(thumb:-1) turant "nahi hai" bolne ki jagah poore 15
@@ -422,7 +546,7 @@ async function generateThumbFrame(message) {
   // kar lete hain - agar khaali hai to bina wait kiye turant null.
   const thumbs = message.media && message.media.document && message.media.document.thumbs;
   if (!thumbs || !thumbs.length) {
-    console.log(`⚠️ [THUMB] msgId=${message.id} ke paas Telegram embedded thumb hai hi nahi - skip.`);
+    console.log(`⚠️ [THUMB] msgId=${message.id} ke paas Telegram embedded thumb bhi nahi hai - skip.`);
     return null;
   }
 
@@ -509,14 +633,15 @@ function startThumbUpload(message) {
   enqueueThumbJob(async () => {
     let result = null;
     try {
-      // Overall safety timeout - agar Telegram se chunk download hi kahin
-      // atak jaaye (network stall), to poori thumbnail pipeline hamesha ke
-      // liye latakti reh sakti thi bina kisi log/error ke. 90 second ke
-      // baad khud hi cancel karke error dikha do.
+      // Overall safety timeout - Screenshot-bot flow (menu wait + "Get
+      // Thumbs" + photo wait) khud hi ~120s tak le sakta hai, isliye ye
+      // outer cap usse bada rakha hai (embedded-thumb fallback ke liye
+      // thoda extra buffer ke saath) - taaki poori pipeline kabhi bina
+      // kisi log/error ke hamesha ke liye latak na jaaye.
       const frameBuffer = await Promise.race([
         generateThumbFrame(message),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("generateThumbFrame 90s timeout - Telegram download atak gaya")), 90000)
+          setTimeout(() => reject(new Error("generateThumbFrame 160s timeout - thumbnail pipeline atak gaya")), 160000)
         ),
       ]);
       if (!frameBuffer || !frameBuffer.length) {
@@ -846,17 +971,20 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
       dataPayload["stream_link"] = mediaInfo.stream_link;
 
       // Thumb upload started the moment the message arrived, in parallel
-      // with the ChatGPT round-trip above - so by now it has almost always
-      // already finished. Wait a little just in case, but never block the
-      // Firebase push for long.
+      // with the ChatGPT round-trip above. Screenshot-bot ka poora flow
+      // (forward -> menu wait -> "Get Thumbs" -> photo wait) ~2 minute
+      // tak le sakta hai, isliye ab yahan bhi utna hi wait karte hain -
+      // warna thumb_link is Firebase push mein kabhi include hi nahi
+      // hota (baad mein koi separate update mechanism nahi hai jo use
+      // add kare). NOTE: message-queue apna khud ka 60s safety-timeout
+      // pehle se rakhta hai (waitForChatGPTReply), isliye agar thumb ko
+      // yahan se zyada time lage to bhi queue agle item pe khud-ba-khud
+      // badh jaati hai - is wait ka asar sirf isi push mein thumb_link
+      // shaamil hone/na hone par padta hai, poori queue par nahi.
       if (mediaInfo.msg_id && thumbPromises.has(mediaInfo.msg_id)) {
-        // Timeout badhaya gaya (8s -> 20s) - ab hum chunk download + ffmpeg
-        // se real frame nikaal rahe hain, jo embedded-thumb download se
-        // dheema hota hai, isliye purana 8s timeout thumb ko beech mein
-        // hi kaat deta tha.
         const thumbUrl = await Promise.race([
           thumbPromises.get(mediaInfo.msg_id),
-          new Promise((resolve) => setTimeout(() => resolve(null), 20000)),
+          new Promise((resolve) => setTimeout(() => resolve(null), 150000)),
         ]);
         if (thumbUrl) dataPayload["thumb_link"] = thumbUrl;
         thumbPromises.delete(mediaInfo.msg_id);
@@ -972,6 +1100,13 @@ async function handleIncomingMessage(event) {
       }
     }
 
+    // C. Screenshot-bot Response Check - iske messages sirf getThumbViaScreenshotBot
+    // ke andar waale waiters ko resolve karte hain, koi aur core logic nahi.
+    const isScreenshotBot = screenshotBotId && senderIdSync === screenshotBotId;
+    if (isScreenshotBot) {
+      handleScreenshotBotMessage(message);
+    }
+
   } catch (err) {
     console.error("❌ Event Handler Error:", err);
   }
@@ -1027,6 +1162,16 @@ async function startServer() {
       console.log("📡 Source Chat ID resolved:", sourceChatId);
     } catch (e) {
       console.error("❌ Source Chat ID resolve nahi hua:", e.message);
+    }
+
+    // Resolve the Screenshot-bot's numeric ID (and cache the full entity)
+    // once - used to detect its replies for the video-thumbnail pipeline.
+    try {
+      screenshotEntity = await client.getEntity(SCREENSHOT_BOT);
+      screenshotBotId = screenshotEntity.id.toString();
+      console.log("📸 Screenshot Bot ID resolved:", screenshotBotId);
+    } catch (e) {
+      console.error("❌ Screenshot Bot ID resolve nahi hua:", e.message);
     }
 
     // New messages
