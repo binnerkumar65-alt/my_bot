@@ -216,7 +216,7 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     console.error("❌ [FIREBASE] Pending entry read error:", e.response?.data || e.message);
   }
 
-  // Agar @P840bot ne content_type abhi tak update nahi kiya ho to default `@other` rakho
+  // @P840bot द्वारा तय किया गया content_type इस्तेमाल होगा, अगर नहीं है तो fallback @other
   const contentType = staged.content_type || "@other";
 
   let thumbUrl = null;
@@ -510,7 +510,7 @@ async function handleIncomingMessage(event) {
 
     // 1. Source Channel Message Processing
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
-      console.log(`⚡ Channel se new message आया ID=${message.id}`);
+      console.log(`⚡ Channel se new message aaya ID=${message.id}`);
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
       
       // Firebase mein instant pending push
@@ -536,7 +536,7 @@ async function handleIncomingMessage(event) {
 
     // 2. Reply from @P840bot (Notes vs DPP Type Checker)
     const isFromTypeChecker = (typeCheckerBotIdStr && senderIdSync === typeCheckerBotIdStr) ||
-                              (typeCheckerBotIdStr && chatIdStr.includes(typeCheckerBotIdStr));
+                             (typeCheckerBotIdStr && chatIdStr.includes(typeCheckerBotIdStr));
 
     if (isFromTypeChecker) {
       const replyText = message.message || message.text || "";
@@ -562,9 +562,9 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 3. ChatGPT Bot Reply (Subject & Chapter Identification)
+    // 3. ChatGPT Bot Reply (Subject & Chapter Identification Only)
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
-                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
+                         (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
       const replyText = message.message || message.text || "";
