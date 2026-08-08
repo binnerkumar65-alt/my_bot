@@ -17,6 +17,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+const crypto = require("crypto");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -31,7 +32,14 @@ const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
 const FIREBASE_BASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL || "https://my-bot-kgrk.onrender.com";
-const IMGBB_API_KEY = process.env.IMGBB_API_KEY || "";
+// Internet Archive (archive.org) IAS3 upload API - ImgBB ki jagah, kyunki
+// ImgBB Render ke datacenter IP ko block kar raha tha ("forbidden", code
+// 103). Archive.org ka upload S3-jaisa hai - single key nahi, ek ACCESS
+// key aur ek SECRET key chahiye. Dono https://archive.org/account/s3.php
+// se milte hain (archive.org account banao -> is page par jao -> "Create
+// S3 Keys").
+const ARCHIVE_ACCESS_KEY = process.env.ARCHIVE_ACCESS_KEY || "";
+const ARCHIVE_SECRET_KEY = process.env.ARCHIVE_SECRET_KEY || "";
 
 if (!apiId || !apiHash) {
   console.error("❌ API_ID या API_HASH missing हैं!");
@@ -324,8 +332,8 @@ function cleanupTranscodeCache() {
 setInterval(cleanupTranscodeCache, 30 * 60 * 1000);
 
 // -------------------------------------------------------------
-// THUMBNAIL (ImgBB) - Telegram's embedded preview JPEG was unreliable
-// (missing for a lot of videos -> nothing ever reached ImgBB/Firebase).
+// THUMBNAIL (archive.org) - Telegram's embedded preview JPEG was unreliable
+// (missing for a lot of videos -> nothing ever reached hosting/Firebase).
 // So instead we pull the ACTUAL video's frame at the ~4-second mark
 // (matches what the HTML already seeks to for its own client-side
 // fallback) by downloading just the first chunk of bytes and running
@@ -424,9 +432,49 @@ async function generateThumbFrame(message) {
   }
 }
 
+// -------------------------------------------------------------
+// THUMBNAIL HOSTING - archive.org (Internet Archive) IAS3 upload API se.
+// Har thumbnail apna alag, globally-unique "item" banata hai (archive.org
+// identifiers duplicate nahi ho sakte), aur upload ke turant baad
+// https://archive.org/download/<identifier>/<filename> link se access
+// hota hai. Note: archive.org kabhi-kabhi ImgBB jitna instant nahi hota -
+// naya item banne ke turant baad ek-do second ka propagation delay ho
+// sakta hai, isliye is function ke poora hone ke baad hi link Firebase
+// mein save karo (jo pehle se ho raha hai).
+// -------------------------------------------------------------
+async function uploadToArchive(buffer, idPrefix) {
+  if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
+    console.log("⚠️ [ARCHIVE] ARCHIVE_ACCESS_KEY/ARCHIVE_SECRET_KEY set nahi hain - upload skip.");
+    return null;
+  }
+  // archive.org identifier: sirf lowercase letters/digits/-/_ /., globally
+  // unique honi chahiye - isliye timestamp + random hex jod diya.
+  const identifier = `${idPrefix}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`.toLowerCase();
+  const filename = "thumb.jpg";
+  const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
+
+  try {
+    await axios.put(uploadUrl, buffer, {
+      headers: {
+        "Content-Type": "image/jpeg",
+        "Authorization": `LOW ${ARCHIVE_ACCESS_KEY}:${ARCHIVE_SECRET_KEY}`,
+        "x-archive-auto-make-bucket": "1",
+        "x-archive-meta-mediatype": "image",
+        "x-archive-meta-collection": "opensource_media",
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+    return `https://archive.org/download/${identifier}/${filename}`;
+  } catch (e) {
+    console.error(`❌ [ARCHIVE] Upload fail hui:`, e.response ? e.response.data : e.message);
+    return null;
+  }
+}
+
 function startThumbUpload(message) {
-  if (!IMGBB_API_KEY) {
-    console.log("⚠️ [THUMB] IMGBB_API_KEY set nahi hai - thumbnail upload skip.");
+  if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
+    console.log("⚠️ [THUMB] ARCHIVE_ACCESS_KEY/ARCHIVE_SECRET_KEY set nahi hain - thumbnail upload skip.");
     return;
   }
   const msgId = message.id;
@@ -438,25 +486,11 @@ function startThumbUpload(message) {
         return null;
       }
 
-      const params = new URLSearchParams();
-      params.append("key", IMGBB_API_KEY);
-      params.append("image", frameBuffer.toString("base64"));
-
-      // ImgBB apni anti-bot layer se Render jaise cloud/datacenter IPs se
-      // aane waale plain axios requests ko block kar deta hai
-      // ("You have been forbidden to use this website.", code 103) - isko
-      // bypass karne ke liye normal browser jaisa User-Agent bhejte hain.
-      const res = await axios.post("https://api.imgbb.com/1/upload", params, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        },
-      });
-      const url = res.data && res.data.data && res.data.data.url;
+      const url = await uploadToArchive(frameBuffer, `labdesk-thumb-${msgId}`);
       if (url) {
-        console.log(`🖼️ [THUMB] ImgBB upload OK msgId=${msgId}: ${url}`);
+        console.log(`🖼️ [THUMB] Archive.org upload OK msgId=${msgId}: ${url}`);
       } else {
-        console.error(`❌ [THUMB] ImgBB response mein URL nahi mila, msgId=${msgId}`);
+        console.error(`❌ [THUMB] Archive.org se URL nahi mila, msgId=${msgId}`);
       }
       return url || null;
     } catch (e) {
@@ -635,11 +669,11 @@ app.get("/stream/:msgId", async (req, res) => {
 // Purane/thumb-less videos ke liye HTML pehli baar <video> tag se hi
 // frame render karta hai (4s wale point tak seek karke). Jaise hi woh
 // frame browser mein dikh jaata hai, HTML usi frame ko canvas se capture
-// karke yahan bhej deta hai. Hum yahan se ImgBB pe upload karte hain
+// karke yahan bhej deta hai. Hum yahan se archive.org pe upload karte hain
 // (bilkul waise hi jaise naye messages ke liye startThumbUpload karta
 // hai) aur Firebase mein us entry ke thumb_link field mein permanently
-// save kar dete hain - taaki agli baar se seedha ImgBB link se load ho,
-// video ko dobara seek karne ki zaroorat na pade.
+// save kar dete hain - taaki agli baar se seedha archive.org link se
+// load ho, video ko dobara seek karne ki zaroorat na pade.
 // -------------------------------------------------------------
 app.post("/thumb-fallback", async (req, res) => {
   try {
@@ -647,28 +681,20 @@ app.post("/thumb-fallback", async (req, res) => {
     if (!image || !subjectKey || !chapterName || !entryKey) {
       return res.status(400).json({ error: "image, subjectKey, chapterName, entryKey zaroori hain" });
     }
-    if (!IMGBB_API_KEY) {
-      return res.status(500).json({ error: "IMGBB_API_KEY set nahi hai" });
+    if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
+      return res.status(500).json({ error: "ARCHIVE_ACCESS_KEY/ARCHIVE_SECRET_KEY set nahi hain" });
     }
 
     // "data:image/jpeg;base64,...." prefix (agar client ne canvas.toDataURL
-    // se bheja hai) hata do - ImgBB ko sirf raw base64 chahiye.
+    // se bheja hai) hata do - sirf raw base64/binary chahiye.
     const base64Image = String(image).replace(/^data:image\/\w+;base64,/, "");
+    const imageBuffer = Buffer.from(base64Image, "base64");
 
-    const params = new URLSearchParams();
-    params.append("key", IMGBB_API_KEY);
-    params.append("image", base64Image);
-
-    const imgbbRes = await axios.post("https://api.imgbb.com/1/upload", params, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-    });
-    const url = imgbbRes.data && imgbbRes.data.data && imgbbRes.data.data.url;
+    const safeEntryKey = String(entryKey).toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
+    const url = await uploadToArchive(imageBuffer, `labdesk-fallback-${safeEntryKey}`);
     if (!url) {
-      console.error(`❌ [THUMB-FALLBACK] ImgBB response mein URL nahi mila, entryKey=${entryKey}`);
-      return res.status(502).json({ error: "ImgBB upload se URL nahi mila" });
+      console.error(`❌ [THUMB-FALLBACK] Archive.org se URL nahi mila, entryKey=${entryKey}`);
+      return res.status(502).json({ error: "Archive.org upload se URL nahi mila" });
     }
 
     // Sirf usi entry ke thumb_link field ko set karo - baaki data (title,
