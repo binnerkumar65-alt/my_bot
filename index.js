@@ -44,11 +44,11 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
   connectionRetries: 5,
 });
 
-let chatgptBotId = null;
+let chatgptBotIdStr = null;
 let chatgptEntity = null;
-let sourceChatId = null;
+let sourceChatIdStr = null;
 let sourceEntity = null;
-let screenshotBotId = null;
+let screenshotBotIdStr = null;
 let screenshotEntity = null;
 
 const messageCache = new Map();
@@ -171,11 +171,9 @@ async function getThumbViaScreenshotBot(streamLink) {
   try {
     latestScreenshotPhoto = null;
 
-    // Send Direct Stream Link
     await client.sendMessage(screenshotEntity, { message: streamLink });
     console.log(`📤 [THUMB-BOT] @screenshort17_bot ko URL bhej diya: ${streamLink}`);
 
-    // Wait max 90s for response
     let waitCount = 0;
     while (!latestScreenshotPhoto && waitCount < 90) {
       await sleep(1000);
@@ -263,7 +261,7 @@ function startThumbUpload(msgId, streamLink) {
 // -------------------------------------------------------------
 // EXPRESS ROUTE
 // -------------------------------------------------------------
-app.get("/", (req, res) => res.send("Bot Active & Pipeline Ready"));
+app.get("/", (req, res) => res.send("Bot Active - ChatGPT Detection Fixed"));
 
 app.get("/stream/:msgId", async (req, res) => {
   try {
@@ -312,13 +310,13 @@ app.get("/stream/:msgId", async (req, res) => {
 });
 
 // -------------------------------------------------------------
-// FIREBASE PUSH (SAFE & SANITIZED)
+// FIREBASE PUSH
 // -------------------------------------------------------------
 async function processReplyAndPushToFirebase(replyText, mediaInfo) {
   if (!replyText) return false;
   if (["सोच...", "thinking..."].some((ig) => replyText.toLowerCase().includes(ig))) return false;
 
-  console.log(`📝 [FIREBASE] Processing reply for Firebase push...`);
+  console.log(`📝 [FIREBASE] ChatGPT Reply Received: "${replyText.substring(0, 50)}..."`);
 
   const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
   let contentType = "@other", lecTag = "", subjectName = "General", chapterName = "General_Lectures";
@@ -332,7 +330,6 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
     else subjectName = seg;
   }
 
-  // Firebase Node Key Cleanup
   const subjectKey = subjectName.trim().replace(/[.$#\[\]/]/g, "_");
   const chapterKey = chapterName.trim().replace(/[.$#\[\]/]/g, "_");
 
@@ -377,7 +374,7 @@ async function processReplyAndPushToFirebase(replyText, mediaInfo) {
 }
 
 // -------------------------------------------------------------
-// EVENT HANDLER
+// EVENT HANDLER (FIXED CHATGPT MATCHING)
 // -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
@@ -394,7 +391,7 @@ async function handleIncomingMessage(event) {
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
     // 1. Source Channel Message
-    if (sourceEntity && (chatIdStr.includes(sourceEntity.id.toString()) || message.chatId?.toString() === sourceChatId)) {
+    if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message आया ID=${message.id}`);
       let streamLink = `${RENDER_URL}/stream/${message.id}`;
       startThumbUpload(message.id, streamLink);
@@ -402,15 +399,22 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 2. ChatGPT Bot Reply
-    if (chatgptBotId && senderIdSync === chatgptBotId) {
+    // 2. ChatGPT Bot Reply (Strict Match via ID & ChatId)
+    const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) || 
+                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
+
+    if (isFromChatGPT) {
+      console.log(`🤖 ChatGPT ka message detected! Parsing reply...`);
       const wasFinal = await processReplyAndPushToFirebase(message.text || "", currentMediaInfo || {});
       if (wasFinal && resolveCurrentReply) resolveCurrentReply();
       return;
     }
 
     // 3. New Screenshot Bot Reply (@screenshort17_bot)
-    if (screenshotBotId && senderIdSync === screenshotBotId) {
+    const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
+                                (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
+
+    if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
         latestScreenshotPhoto = message;
       }
@@ -435,16 +439,18 @@ async function startServer() {
     await client.connect();
 
     chatgptEntity = await client.getEntity(CHATGPT_BOT);
-    chatgptBotId = chatgptEntity.id.toString();
+    chatgptBotIdStr = chatgptEntity.id.toString();
 
     sourceEntity = await client.getEntity(SOURCE_CHAT);
-    sourceChatId = sourceEntity.id.toString();
+    sourceChatIdStr = sourceEntity.id.toString();
 
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
-    screenshotBotId = screenshotEntity.id.toString();
+    screenshotBotIdStr = screenshotEntity.id.toString();
+
+    console.log(`📌 Target IDs Loaded - ChatGPT: ${chatgptBotIdStr} | Source: ${sourceChatIdStr} | ScreenBot: ${screenshotBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
-    console.log("🤖 Client Ready! Complete System Synchronized.");
+    console.log("🤖 Client Ready! Detection pipeline synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
