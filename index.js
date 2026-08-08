@@ -195,19 +195,33 @@ async function processSendQueue() {
 
 async function patchAiTagsToFirebase(msgId, replyText) {
   const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
-  let contentType = "@other", lecTag = "", subjectName = "General", chapterName = "General_Lectures";
 
-  for (const seg of segments) {
-    const sLower = seg.toLowerCase();
-    if (sLower.startsWith("dpp")) contentType = "@dpp";
-    else if (sLower.startsWith("notes")) contentType = "@notes";
-    else if (sLower.startsWith("other")) contentType = "@other";
-    else if (sLower.startsWith("lec")) lecTag = "@" + seg;
-    else if (/[\u0900-\u097F]/.test(seg)) chapterName = seg;
-    else subjectName = seg;
-  }
-  subjectName = subjectName.trim();
-  chapterName = chapterName.trim();
+  // IMPORTANT: rule ki FIXED ORDER trust karte hain (1=subject, 2=chapter,
+  // 3=content-type, 4=lecture-optional) - koi keyword-guessing nahi karte.
+  // Pehle keyword-matching se galat bug ban raha tha: jab ChatGPT content-type
+  // ke liye "video"/"test"/kuch aur word bhejta tha (jo "dpp"/"notes"/"other"
+  // se match nahi hota), wo word galti se SUBJECT maan liya jaata tha aur
+  // asli subject (jaise "Physics") overwrite ho jaata tha. Ab AI jo bhi
+  // 3rd position pe bole, usko sirf dpp/notes ke against check karte hain -
+  // baaki HAR cheez (video/test/extra lecture/kuch bhi) seedha @other maani
+  // jaati hai, subject/chapter kabhi disturb nahi hote.
+  const subjectName = (segments[0] || "General").trim();
+  const chapterName = (segments[1] || "General_Lectures").trim();
+  const rawContentSeg = (segments[2] || "").trim();
+  const seg4 = (segments[3] || "").trim();
+
+  const rawLower = rawContentSeg.toLowerCase();
+  let contentType = "@other";
+  if (rawLower.startsWith("dpp")) contentType = "@dpp";
+  else if (rawLower.startsWith("notes")) contentType = "@notes";
+  // baaki kuch bhi ho (video/other/test/extra lecture) - @other hi rahega
+
+  // Lecture number normally 4th position pe hota hai; agar kabhi 3rd position
+  // pe hi "Lec.." aa jaaye (ChatGPT ne content-type skip kar diya ho), tab bhi
+  // pakad lete hain.
+  let lecTag = "";
+  if (/^lec/i.test(seg4)) lecTag = "@" + seg4;
+  else if (/^lec/i.test(rawContentSeg)) lecTag = "@" + rawContentSeg;
 
   // HTML dashboard hamesha /{Subject}/{Chapter}/{msgId} nested path se
   // padhta hai (subject match 'phys'/'chem'/'bio' se, phir usi subject ke
