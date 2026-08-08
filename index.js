@@ -384,16 +384,9 @@ async function runThumbQueue() {
   isThumbQueueRunning = false;
 }
 
-// Sirf video ke shuru ka itna hissa download karo jitna 4-second-mark
-// tak ka frame nikaalne ke liye kaafi ho. Telegram/streaming-optimized
-// mp4 mein moov atom aam taur pe shuru mein hi hota hai (isi wajah se
-// /stream route pe seek turant kaam karta hai), isliye chhota chunk
-// bhi ffmpeg ke liye decode karne ke liye kaafi hota hai.
-// Ek download attempt ke liye zyada se zyada itna time - agar Telegram se
-// connection kahin stall ho jaaye (jaisa msgId=801 mein hua, poore 90
-// second sirf pehle hi attempt mein latak gaye), to itne time ke baad
-// us attempt ko chhod kar agla fallback try karo, bina poori thumbnail
-// pipeline ko block kiye.
+// Embedded thumb download ke liye ek attempt ka max time - agar Telegram
+// se connection kahin stall ho jaaye, to hamesha ke liye latakne ki
+// jagah itne time ke baad hi fail ho jaao.
 const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 15000;
 
 function withTimeout(promise, ms, timeoutMessage) {
@@ -414,96 +407,25 @@ function withTimeout(promise, ms, timeoutMessage) {
   return guarded;
 }
 
-async function downloadVideoChunk(message, maxBytes) {
-  const doc = message.media && message.media.document;
-  const fileSize = doc ? Number(doc.size) || 0 : 0;
-  const limit = fileSize ? Math.min(fileSize, maxBytes) : maxBytes;
-
-  const chunks = [];
-  const stream = client.iterDownload({
-    file: message.media,
-    offset: bigInt(0),
-    limit,
-  });
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-}
-
-// videoBuffer ke andar seekSeconds waale point ka frame nikaal kar
-// JPEG buffer wapas karta hai. Temp files hamesha cleanup ho jaati hain,
-// chahe ffmpeg fail ho jaaye.
-function extractFrame(videoBuffer, seekSeconds) {
-  const uid = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  const videoPath = path.join(os.tmpdir(), `thumbsrc_${uid}.mp4`);
-  const framePath = path.join(os.tmpdir(), `thumbout_${uid}.jpg`);
-
-  return (async () => {
-    await fs.promises.writeFile(videoPath, videoBuffer);
-    try {
-      await new Promise((resolve, reject) => {
-        const args = [
-          "-y",
-          "-ss", String(seekSeconds),
-          "-i", videoPath,
-          "-frames:v", "1",
-          "-q:v", "2",
-          framePath,
-        ];
-        const proc = spawn(ffmpegPath, args);
-        let stderr = "";
-        proc.stderr.on("data", (d) => (stderr += d.toString()));
-        proc.on("error", reject);
-        proc.on("close", (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-300)}`));
-        });
-      });
-      return await fs.promises.readFile(framePath);
-    } finally {
-      fs.promises.unlink(videoPath).catch(() => {});
-      fs.promises.unlink(framePath).catch(() => {});
-    }
-  })();
-}
-
-// Chhote chunk se try karo, phir bade chunk se, phir earlier timestamps
-// pe (agar video 4 second se chhota nikla). Sab fail ho to Telegram ke
-// apne embedded preview thumb pe fallback karo - taaki thumbnail kabhi
-// bhi poori tarah khaali na jaaye.
+// Ab video ke bade chunks download karke ffmpeg se frame nikaalne ki
+// koshish NAHI karte - wo hi timeouts ("Telegram se chunk atak gaya") aur
+// OOM crash (har ffmpeg spawn + multi-MB buffer memory khaata hai) dono
+// ki wajah tha. Iski jagah seedha Telegram/Telethon ka apna embedded
+// video-thumbnail (chhoti, kuch KB ki JPEG jo Telegram video ke saath
+// hamesha store karta hai) download karte hain - ek hi halka network call,
+// koi ffmpeg process nahi, koi bada buffer nahi.
 async function generateThumbFrame(message) {
-  const attempts = [
-    { bytes: 3 * 1024 * 1024, seek: 4 },
-    { bytes: 8 * 1024 * 1024, seek: 4 },
-    { bytes: 8 * 1024 * 1024, seek: 1 },
-    { bytes: 8 * 1024 * 1024, seek: 0 },
-  ];
-
-  for (const attempt of attempts) {
-    try {
-      const videoBuffer = await withTimeout(
-        downloadVideoChunk(message, attempt.bytes),
-        DOWNLOAD_ATTEMPT_TIMEOUT_MS,
-        `download ${DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000}s timeout - Telegram se chunk atak gaya`
-      );
-      if (!videoBuffer || !videoBuffer.length) continue;
-      const frame = await extractFrame(videoBuffer, attempt.seek);
-      if (frame && frame.length) return frame;
-    } catch (e) {
-      console.error(`⚠️ [THUMB] attempt (bytes=${attempt.bytes}, seek=${attempt.seek}) fail hui:`, e.message);
-    }
-  }
-
-  console.log("⚠️ [THUMB] Sab attempts fail - Telegram ke embedded thumb pe fallback kar rahe hain.");
   try {
-    return await withTimeout(
+    const thumb = await withTimeout(
       client.downloadMedia(message, { thumb: -1 }),
       DOWNLOAD_ATTEMPT_TIMEOUT_MS,
       `embedded thumb download ${DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000}s timeout`
     );
+    if (thumb && thumb.length) return thumb;
+    console.log(`⚠️ [THUMB] Embedded thumb khaali/nahi mila msgId=${message.id}`);
+    return null;
   } catch (e) {
-    console.error("❌ [THUMB] Embedded thumb fallback bhi fail hui:", e.message);
+    console.error("❌ [THUMB] Embedded thumb download fail hui:", e.message);
     return null;
   }
 }
@@ -739,8 +661,17 @@ app.get("/stream/:msgId", async (req, res) => {
         limit: chunkSize,
       });
 
+      // IMPORTANT: res.write() ka return value check karna zaroori hai. Agar
+      // client (mobile/slow network) itni tezi se data consume nahi kar
+      // paa raha jitni tezi se Telegram se chunks aa rahe hain, to bina
+      // is drain-wait ke Node internally sab kuch memory mein buffer
+      // karta rehta hai - yahi 512MB OOM crash ("Ran out of memory") ki
+      // sabse badi wajah thi, khaaskar poori/badi video file stream karte
+      // waqt.
       for await (const chunk of stream) {
-        res.write(chunk);
+        if (!res.write(chunk)) {
+          await new Promise((resolve) => res.once("drain", resolve));
+        }
       }
       res.end();
     } else {
@@ -755,7 +686,9 @@ app.get("/stream/:msgId", async (req, res) => {
       const stream = client.iterDownload({ file: media, offset: bigInt(0) });
 
       for await (const chunk of stream) {
-        res.write(chunk);
+        if (!res.write(chunk)) {
+          await new Promise((resolve) => res.once("drain", resolve));
+        }
       }
       res.end();
     }
