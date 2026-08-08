@@ -124,8 +124,9 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
+  // यहाँ put का उपयोग किया गया है ताकि /Meta नोड के अंदर tagMsgCount ऑब्जेक्ट पक्के तौर पर बन जाए
   axios
-    .patch(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
+    .put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
     .catch((e) => console.error("❌ [RULE-REMINDER] Counter save error:", e.response?.data || e.message));
 }
@@ -527,7 +528,7 @@ async function handleIncomingMessage(event) {
         startThumbUpload(message.id, streamLink);
       } else if (message.media && message.media.document) {
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
-        forwardDocTypeChecker(message.id);
+        forwardDocToTypeChecker(message.id);
       }
 
       const fallbackText = isVideoMessage(message)
