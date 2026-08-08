@@ -431,11 +431,12 @@ function isVideoDocument(message) {
 
 // -------------------------------------------------------------
 // SCREENSHOT-BOT (@screenshotit_bot) - video ko is bot ko forward karo,
-// wo ek options-menu ke saath reply karta hai, usme "Get Thumbs" button
-// hai (reply-keyboard, isliye "click" karna matlab wahi text bhej dena),
-// aur uske baad wo asli video-frame se bani thumbnail photo bhejta hai.
-// Ye Telegram ke apne embedded-thumb se zyada reliable hai (bahut saari
-// videos mein embedded thumb hota hi nahi).
+// wo ek options-menu ke saath reply karta hai, usme "Get Thumbs" ek
+// inline-keyboard button hai (message.click() se asal mein click/callback
+// simulate karte hain, plain text nahi bhejte), aur uske baad wo asli
+// video-frame se bani thumbnail photo bhejta hai. Ye Telegram ke apne
+// embedded-thumb se zyada reliable hai (bahut saari videos mein embedded
+// thumb hota hi nahi).
 //
 // Ek time pe sirf EK reply ka wait ho raha hota hai (thumbQueue pehle se
 // sequential hai - ek waqt sirf ek hi video is pipeline mein hota hai),
@@ -502,10 +503,19 @@ async function getThumbViaScreenshotBot(message) {
       return null;
     }
 
-    // 3. "Get Thumbs" button click karo - reply-keyboard hai, isliye
-    // "click" karna matlab seedha wahi text message bhej dena.
-    await client.sendMessage(screenshotEntity, { message: "Get Thumbs" });
-    console.log(`🖱️ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" bheja.`);
+    // 3. "Get Thumbs" button asal mein CLICK karo. Ye buttons inline-keyboard
+    // hain (callback-based), reply-keyboard nahi - isliye plain text
+    // "Get Thumbs" bhejna sirf ek normal message ban jaata hai, bot use
+    // button-click nahi samajhta aur kuch nahi hota. GramJS ka
+    // message.click() method sahi tareeka hai - ye khud pehchan leta hai
+    // ki button inline hai ya reply-keyboard, aur uske hisaab se asli
+    // click (callback query) simulate karta hai.
+    const clickResult = await menuMsg.click({ text: "Get Thumbs" });
+    if (!clickResult) {
+      console.error(`❌ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" button nahi mila/click fail hua.`);
+      return null;
+    }
+    console.log(`🖱️ [THUMB-BOT] msgId=${message.id}: "Get Thumbs" click kiya.`);
 
     // 4. Thumbnail photo ka wait
     const photoMsg = await waitForScreenshotBotMessage(SCREENSHOT_PHOTO_TIMEOUT_MS, (m) => !!m.photo);
