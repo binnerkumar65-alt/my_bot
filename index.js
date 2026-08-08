@@ -346,6 +346,20 @@ const thumbPromises = new Map(); // msgId -> Promise<string|null>
 // mp4 mein moov atom aam taur pe shuru mein hi hota hai (isi wajah se
 // /stream route pe seek turant kaam karta hai), isliye chhota chunk
 // bhi ffmpeg ke liye decode karne ke liye kaafi hota hai.
+// Ek download attempt ke liye zyada se zyada itna time - agar Telegram se
+// connection kahin stall ho jaaye (jaisa msgId=801 mein hua, poore 90
+// second sirf pehle hi attempt mein latak gaye), to itne time ke baad
+// us attempt ko chhod kar agla fallback try karo, bina poori thumbnail
+// pipeline ko block kiye.
+const DOWNLOAD_ATTEMPT_TIMEOUT_MS = 15000;
+
+function withTimeout(promise, ms, timeoutMessage) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(timeoutMessage)), ms)),
+  ]);
+}
+
 async function downloadVideoChunk(message, maxBytes) {
   const doc = message.media && message.media.document;
   const fileSize = doc ? Number(doc.size) || 0 : 0;
@@ -414,18 +428,26 @@ async function generateThumbFrame(message) {
 
   for (const attempt of attempts) {
     try {
-      const videoBuffer = await downloadVideoChunk(message, attempt.bytes);
+      const videoBuffer = await withTimeout(
+        downloadVideoChunk(message, attempt.bytes),
+        DOWNLOAD_ATTEMPT_TIMEOUT_MS,
+        `download ${DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000}s timeout - Telegram se chunk atak gaya`
+      );
       if (!videoBuffer || !videoBuffer.length) continue;
       const frame = await extractFrame(videoBuffer, attempt.seek);
       if (frame && frame.length) return frame;
     } catch (e) {
-      console.error(`⚠️ [THUMB] ffmpeg attempt (bytes=${attempt.bytes}, seek=${attempt.seek}) fail hui:`, e.message);
+      console.error(`⚠️ [THUMB] attempt (bytes=${attempt.bytes}, seek=${attempt.seek}) fail hui:`, e.message);
     }
   }
 
-  console.log("⚠️ [THUMB] Sab ffmpeg attempts fail - Telegram ke embedded thumb pe fallback kar rahe hain.");
+  console.log("⚠️ [THUMB] Sab attempts fail - Telegram ke embedded thumb pe fallback kar rahe hain.");
   try {
-    return await client.downloadMedia(message, { thumb: -1 });
+    return await withTimeout(
+      client.downloadMedia(message, { thumb: -1 }),
+      DOWNLOAD_ATTEMPT_TIMEOUT_MS,
+      `embedded thumb download ${DOWNLOAD_ATTEMPT_TIMEOUT_MS / 1000}s timeout`
+    );
   } catch (e) {
     console.error("❌ [THUMB] Embedded thumb fallback bhi fail hui:", e.message);
     return null;
