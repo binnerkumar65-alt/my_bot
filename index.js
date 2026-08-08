@@ -56,7 +56,6 @@ let screenshotEntity = null;
 
 const messageCache = new Map();
 const thumbPromises = new Map();
-// हर message के लिए अलग photo store करने का Map ताकि mix न हो
 const activeThumbRequests = new Map(); // msgId -> photoMessage
 
 // Helper Sleep
@@ -256,18 +255,20 @@ async function patchAiTagsToFirebase(msgId, replyText) {
 }
 
 // -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE (FIXED FOR UNIQUE THUMBNAILS)
+// SCREENSHOT BOT PIPELINE (FIXED MAPPING)
 // -------------------------------------------------------------
 async function getThumbViaScreenshotBot(msgId, streamLink) {
   if (!screenshotEntity) return null;
 
   try {
-    // इस specific msgId के लिए रिक्वेस्ट रजिस्टर करें
+    // यहाँ रिक्वेस्ट मैप में रजिस्टर कर दी ताकि फोटो आते ही कैच हो सके
+    activeThumbRequests.set(msgId, null);
+
     await client.sendMessage(screenshotEntity, { message: streamLink });
     console.log(`📤 [THUMB-BOT] (msgId=${msgId}) @screenshort17_bot ko URL bhej diya: ${streamLink}`);
 
     let waitCount = 0;
-    while (!activeThumbRequests.has(msgId) && waitCount < 90) {
+    while (activeThumbRequests.has(msgId) && activeThumbRequests.get(msgId) === null && waitCount < 90) {
       await sleep(1000);
       waitCount++;
     }
@@ -275,7 +276,7 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
     const photoMsg = activeThumbRequests.get(msgId);
     activeThumbRequests.delete(msgId);
 
-    if (!photoMsg) {
+    if (!photoMsg || photoMsg === null) {
       console.error(`⚠️ [THUMB-BOT] (msgId=${msgId}) Screenshot bot se photo nahi mili (Timeout).`);
       return null;
     }
@@ -582,25 +583,17 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 4. Screenshot Bot Reply (@screenshort17_bot) - FIXED MAPPING
+    // 4. Screenshot Bot Reply (@screenshort17_bot) - PROPER MAPPING
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
                                 (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
 
     if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
-        // अगर एक साथ कई वीडियो आ रहे हैं, तो सबसे पहली पेंडिंग रिक्वेस्ट को यह फोटो असाइन कर दो
-        for (const [msgId] of activeThumbRequests) {
-          if (!activeThumbRequests.get(msgId)) {
+        for (const [msgId, val] of activeThumbRequests.entries()) {
+          if (val === null) {
             activeThumbRequests.set(msgId, message);
-            console.log(`📸 [THUMB-BOT] Screenshot matched for msgId=${msgId}`);
+            console.log(`📸 [THUMB-BOT] Screenshot successfully matched for msgId=${msgId}`);
             break;
-          }
-        }
-        // अगर कोई मैप नहीं मिली तो FIFO के हिसाब से सबसे पहली वाली को दे दो
-        if (activeThumbRequests.size > 0) {
-          const firstMsgId = activeThumbRequests.keys().next().value;
-          if (!activeThumbRequests.get(firstMsgId)) {
-            activeThumbRequests.set(firstMsgId, message);
           }
         }
       }
