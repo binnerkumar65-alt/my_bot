@@ -26,7 +26,7 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-const SOURCE_CHAT = "@sxhckfufig";
+const SOURCE_CHAT = "@YAKEEN_NEET_HINDI_2027_LEC";
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
