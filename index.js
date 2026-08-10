@@ -26,7 +26,6 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-// 🔁 SOURCE CHANNEL CHANGED TO @sxhckfufig
 const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
@@ -57,14 +56,13 @@ let screenshotEntity = null;
 
 const messageCache = new Map();
 const thumbPromises = new Map();
-const activeThumbRequests = new Map(); // msgId -> photoMessage
+const activeThumbRequests = new Map();
 
-// Helper Sleep
+// 🆕 Track finalized Firebase paths for late @P840bot patches
+const finalizedDocPaths = new Map(); // msgId -> {subject, chapter}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// -------------------------------------------------------------
-// 🧹 MEMORY & TEMP FILE CLEANUP
-// -------------------------------------------------------------
 function clearMemory() {
   try {
     messageCache.clear();
@@ -97,9 +95,6 @@ function cleanupTempFiles() {
 }
 setInterval(cleanupTempFiles, 15 * 1000);
 
-// -------------------------------------------------------------
-// CHATGPT PROMPT (Only Subject, Chapter & Lecture No.)
-// -------------------------------------------------------------
 const RULE_REMINDER_TEXT = `नियम याद दिला रहा हूँ:
 1. विषय टैग (जैसे: @Physics, @Chemistry, @Biology)
 2. अध्याय टैग (जैसे: @समतल में गति)
@@ -132,15 +127,15 @@ function saveTagMsgCount() {
 }
 
 const sendQueue = [];
-const pendingReplyQueue = []; 
-const pendingTypeQueue = [];  
+const pendingReplyQueue = [];
+const pendingTypeQueue = [];
 let isSending = false;
 
 function enqueueForTagging(msgId, text) {
   sendQueue.push({ msgId, text, isReminder: false });
   
   tagMsgCount++;
-  console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | Current Counter: ${tagMsgCount} | bhejne ko baaki: ${sendQueue.length}`);
+  console.log(`📥 [TAG-QUEUE] Add hua msgId=${msgId} | Counter: ${tagMsgCount} | bhejne ko baaki: ${sendQueue.length}`);
 
   if (tagMsgCount >= 10) {
     sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
@@ -181,9 +176,6 @@ async function processSendQueue() {
   isSending = false;
 }
 
-// -------------------------------------------------------------
-// P840BOT KO DOCUMENT FORWARD KARNA
-// -------------------------------------------------------------
 async function forwardDocToTypeChecker(messageId) {
   try {
     if (!typeCheckerEntity) typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
@@ -201,9 +193,6 @@ async function forwardDocToTypeChecker(messageId) {
   }
 }
 
-// -------------------------------------------------------------
-// FIREBASE TAG PATCHING
-// -------------------------------------------------------------
 async function patchAiTagsToFirebase(msgId, replyText) {
   const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
 
@@ -254,15 +243,17 @@ async function patchAiTagsToFirebase(msgId, replyText) {
   try {
     await axios.put(finalUrl, finalPayload);
     console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
+    
+    // 🆕 Track finalized path for late @P840bot patches
+    finalizedDocPaths.set(msgId, { subject: subjectName, chapter: chapterName });
+    setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000); // 30 min baad clean
+    
     axios.delete(pendingUrl).catch(() => {});
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
 }
 
-// -------------------------------------------------------------
-// SCREENSHOT BOT PIPELINE
-// -------------------------------------------------------------
 async function getThumbViaScreenshotBot(msgId, streamLink) {
   if (!screenshotEntity) return null;
 
@@ -301,9 +292,6 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
   }
 }
 
-// -------------------------------------------------------------
-// ARCHIVE UPLOAD
-// -------------------------------------------------------------
 async function uploadToArchive(buffer, idPrefix) {
   if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
     console.error("❌ ARCHIVE KEYS missing!");
@@ -375,9 +363,6 @@ function startThumbUpload(msgId, streamLink) {
   })();
 }
 
-// -------------------------------------------------------------
-// EXPRESS ROUTES
-// -------------------------------------------------------------
 app.get("/", (req, res) => res.send("Bot Active - ChatGPT & TypeChecker Pipeline Integrated"));
 
 app.get("/stream/:msgId", async (req, res) => {
@@ -426,7 +411,6 @@ app.get("/stream/:msgId", async (req, res) => {
   }
 });
 
-// 🚫 VIDEO DOWNLOAD BLOCKED — Sirf Documents (Notes/DPP) download honge
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -437,7 +421,6 @@ app.get("/download/:msgId", async (req, res) => {
 
     const message = messages[0];
 
-    // 🚫 Video download block
     if (isVideoMessage(message)) {
       return res.status(403).send("Video downloads are not allowed.");
     }
@@ -471,9 +454,6 @@ app.get("/download/:msgId", async (req, res) => {
   }
 });
 
-// -------------------------------------------------------------
-// FIREBASE PUSH (STAGING / PENDING)
-// -------------------------------------------------------------
 async function pushDirectToFirebase(msgId, streamLink) {
   const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
 
@@ -505,9 +485,6 @@ async function pushDirectToFirebase(msgId, streamLink) {
   }
 }
 
-// -------------------------------------------------------------
-// EVENT HANDLER
-// -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
     const message = event.message;
@@ -526,7 +503,6 @@ async function handleIncomingMessage(event) {
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message aaya ID=${message.id}`);
 
-      // 🚫 Sirf text/link wale messages ignore karo
       const hasMedia = message.media && (message.media.document || message.media.photo);
       if (!hasMedia) {
         console.log(`⏩ [IGNORE] Sirf text/link hai ID=${message.id}, ignore kar diya.`);
@@ -545,14 +521,17 @@ async function handleIncomingMessage(event) {
         enqueueForTagging(message.id, fallbackText);
         console.log(`📨 [VIDEO] msgId=${message.id} → AI ko caption bheja: "${fallbackText.substring(0, 60)}..."`);
       }
-      // 📄 DOCUMENT → Sirf @P840bot ko forward karo, AI ko mat bhejo
+      // 📄 DOCUMENT → @P840bot + AI ko caption bhejo (taaki chapter/lec mile)
       else if (message.media && message.media.document) {
-        console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
+        console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot + AI...`);
         pushDirectToFirebase(message.id, streamLink);
         forwardDocToTypeChecker(message.id);
-        // ❌ Document ka caption AI ko nahi bhejna
+        
+        // 🆕 AI ko bhi bhejo taaki chapter/lecture tag ho sake
+        const docCaption = getDocumentFileName(message) || captionText || "Document File";
+        enqueueForTagging(message.id, docCaption);
+        console.log(`📨 [DOCUMENT] msgId=${message.id} → AI ko caption bheja: "${docCaption.substring(0, 60)}..."`);
       }
-      // 🖼️ PHOTO/OTHER → Ignore
       else {
         console.log(`⏩ [IGNORE] Photo/Other media ID=${message.id}, ignore kar diya.`);
       }
@@ -576,13 +555,31 @@ async function handleIncomingMessage(event) {
       if (matched) {
         console.log(`📝 [TYPE-CHECKER] msgId=${matched.msgId} ka type "${detectedType}" mil gaya.`);
         const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
+        
         try {
           await axios.patch(pendingUrl, { 
             content_type: detectedType,
             download_link: `${RENDER_URL}/download/${matched.msgId}` 
           });
         } catch (e) {
-          console.error("❌ Type Patch Error:", e.message);
+          // 🆕 Agar pending nahi mila (already deleted/finalized), toh final mein patch karo
+          if (e.response && e.response.status === 404) {
+            const finalPath = finalizedDocPaths.get(matched.msgId);
+            if (finalPath) {
+              const finalPatchUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(finalPath.subject)}/${encodeURIComponent(finalPath.chapter)}/${matched.msgId}.json`;
+              try {
+                await axios.patch(finalPatchUrl, { 
+                  content_type: detectedType,
+                  download_link: `${RENDER_URL}/download/${matched.msgId}` 
+                });
+                console.log(`📝 [TYPE-CHECKER] Final entry patched for msgId=${matched.msgId}`);
+              } catch (e2) {
+                console.error("❌ Final Patch Error:", e2.message);
+              }
+            }
+          } else {
+            console.error("❌ Type Patch Error:", e.message);
+          }
         }
       }
       return;
@@ -598,7 +595,6 @@ async function handleIncomingMessage(event) {
       const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
 
       if (isThinking) return;
-
       if (!replyText.trim().startsWith("@")) return;
 
       const matched = pendingReplyQueue.shift();
@@ -608,7 +604,16 @@ async function handleIncomingMessage(event) {
         const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
 
         if (segments.length < 3 || !hasLectureTag) {
-          console.log(`⚠️ [CHATGPT] Galat reply format msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → Ignore kar diya.`);
+          console.log(`⚠️ [CHATGPT] Galat reply format msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
+          
+          // 🆕 PENDING DELETE karo Firebase se
+          const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
+          try {
+            await axios.delete(pendingUrl);
+            console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (invalid AI reply)`);
+          } catch (e) {
+            console.error("❌ [FIREBASE] Pending delete error:", e.message);
+          }
           
           // 🔁 Turant AI ko rules bhejo
           sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
@@ -650,9 +655,6 @@ async function handleIncomingMessage(event) {
   }
 }
 
-// -------------------------------------------------------------
-// SERVER INIT
-// -------------------------------------------------------------
 async function startServer() {
   app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
 
