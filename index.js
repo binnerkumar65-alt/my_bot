@@ -25,7 +25,8 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-const SOURCE_CHAT = "@YAKEEN_NEET_HINDI_2027_LEC";
+// 🆕 DONO CHANNELS SUPPORT
+const SOURCE_CHATS = ["@sxhckfufig", "@YAKEEN_NEET_HINDI_2027_LEC"];
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
@@ -48,18 +49,18 @@ let chatgptBotIdStr = null;
 let chatgptEntity = null;
 let typeCheckerBotIdStr = null;
 let typeCheckerEntity = null;
-let sourceChatIdStr = null;
-let sourceEntity = null;
 let screenshotBotIdStr = null;
 let screenshotEntity = null;
+
+// 🆕 Multiple source channels tracking
+const sourceEntities = new Map(); // chatIdStr -> entity
+const sourceChatIdStrs = new Set();
 
 const messageCache = new Map();
 const thumbPromises = new Map();
 const activeThumbRequests = new Map();
 const finalizedDocPaths = new Map();
-
-// 🆕 Track pending messages with timestamp for auto-cleanup
-const pendingTimestamps = new Map(); // msgId -> timestamp (ms)
+const pendingTimestamps = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -176,14 +177,13 @@ async function processSendQueue() {
   isSending = false;
 }
 
-async function forwardDocToTypeChecker(messageId) {
+async function forwardDocToTypeChecker(messageId, fromPeer) {
   try {
     if (!typeCheckerEntity) typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
-    if (!sourceEntity) sourceEntity = await client.getEntity(SOURCE_CHAT);
 
     await client.forwardMessages(typeCheckerEntity, {
       messages: [messageId],
-      fromPeer: sourceEntity,
+      fromPeer: fromPeer,
     });
 
     pendingTypeQueue.push({ msgId: messageId });
@@ -248,8 +248,6 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000);
     
     axios.delete(pendingUrl).catch(() => {});
-    
-    // 🆕 Clean up from pendingTimestamps since it's no longer pending
     pendingTimestamps.delete(msgId);
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
@@ -365,47 +363,53 @@ function startThumbUpload(msgId, streamLink) {
   })();
 }
 
-app.get("/", (req, res) => res.send("Bot Active - ChatGPT & TypeChecker Pipeline Integrated"));
+app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline Integrated"));
 
+// 🆕 STREAM: Dono channels mein se dhoondhega
 app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
-    if (!sourceEntity) sourceEntity = await client.getEntity(SOURCE_CHAT);
+    
+    for (const [chatIdStr, entity] of sourceEntities) {
+      const messages = await client.getMessages(entity, { ids: msgId });
+      if (!messages || !messages[0] || !messages[0].media) continue;
 
-    const messages = await client.getMessages(sourceEntity, { ids: msgId });
-    if (!messages || !messages[0] || !messages[0].media) return res.status(404).send("Not Found");
+      const message = messages[0];
+      const media = message.media;
+      const fileSize = Number(media.document ? media.document.size : 0);
+      const range = req.headers.range;
 
-    const message = messages[0];
-    const media = message.media;
-    const fileSize = Number(media.document ? media.document.size : 0);
-    const range = req.headers.range;
+      if (range && fileSize) {
+        const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+        const start = parseInt(startStr, 10);
+        const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+        const chunkSize = end - start + 1;
 
-    if (range && fileSize) {
-      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(startStr, 10);
-      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
+        res.writeHead(206, {
+          "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+          "Accept-Ranges": "bytes",
+          "Content-Length": chunkSize,
+          "Content-Type": "video/mp4",
+        });
 
-      res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunkSize,
-        "Content-Type": "video/mp4",
-      });
-
-      const stream = client.iterDownload({ file: media, offset: bigInt(start), limit: chunkSize });
-      for await (const chunk of stream) {
-        if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        const stream = client.iterDownload({ file: media, offset: bigInt(start), limit: chunkSize });
+        for await (const chunk of stream) {
+          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        }
+        res.end();
+      } else {
+        res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": fileSize });
+        const stream = client.iterDownload({ file: media, offset: bigInt(0) });
+        for await (const chunk of stream) {
+          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        }
+        res.end();
       }
-      res.end();
-    } else {
-      res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": fileSize });
-      const stream = client.iterDownload({ file: media, offset: bigInt(0) });
-      for await (const chunk of stream) {
-        if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
-      }
-      res.end();
+      return; // Message mil gaya, return
     }
+
+    // Kisi channel mein nahi mila
+    res.status(404).send("Not Found");
   } catch (e) {
     if (!res.headersSent) res.status(500).send("Streaming Error");
   } finally {
@@ -413,42 +417,47 @@ app.get("/stream/:msgId", async (req, res) => {
   }
 });
 
+// 🆕 DOWNLOAD: Dono channels mein se dhoondhega
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
-    if (!sourceEntity) sourceEntity = await client.getEntity(SOURCE_CHAT);
+    
+    for (const [chatIdStr, entity] of sourceEntities) {
+      const messages = await client.getMessages(entity, { ids: msgId });
+      if (!messages || !messages[0] || !messages[0].media) continue;
 
-    const messages = await client.getMessages(sourceEntity, { ids: msgId });
-    if (!messages || !messages[0] || !messages[0].media) return res.status(404).send("Not Found");
+      const message = messages[0];
 
-    const message = messages[0];
+      if (isVideoMessage(message)) {
+        return res.status(403).send("Video downloads are not allowed.");
+      }
 
-    if (isVideoMessage(message)) {
-      return res.status(403).send("Video downloads are not allowed.");
+      const media = message.media;
+      const doc = media.document;
+      const fileSize = Number(doc ? doc.size : 0);
+      const mimeType = (doc && doc.mimeType) || "application/octet-stream";
+
+      let fileName = `file_${msgId}`;
+      if (doc && doc.attributes) {
+        const nameAttr = doc.attributes.find((a) => a.className === "DocumentAttributeFilename");
+        if (nameAttr && nameAttr.fileName) fileName = nameAttr.fileName;
+      }
+
+      res.writeHead(200, {
+        "Content-Type": mimeType,
+        "Content-Length": fileSize,
+        "Content-Disposition": `attachment; filename="${encodeURIComponent(fileName)}"`,
+      });
+
+      const stream = client.iterDownload({ file: media, offset: bigInt(0) });
+      for await (const chunk of stream) {
+        if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+      }
+      res.end();
+      return; // Message mil gaya, return
     }
 
-    const media = message.media;
-    const doc = media.document;
-    const fileSize = Number(doc ? doc.size : 0);
-    const mimeType = (doc && doc.mimeType) || "application/octet-stream";
-
-    let fileName = `file_${msgId}`;
-    if (doc && doc.attributes) {
-      const nameAttr = doc.attributes.find((a) => a.className === "DocumentAttributeFilename");
-      if (nameAttr && nameAttr.fileName) fileName = nameAttr.fileName;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": mimeType,
-      "Content-Length": fileSize,
-      "Content-Disposition": `attachment; filename="${encodeURIComponent(fileName)}"`,
-    });
-
-    const stream = client.iterDownload({ file: media, offset: bigInt(0) });
-    for await (const chunk of stream) {
-      if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
-    }
-    res.end();
+    res.status(404).send("Not Found");
   } catch (e) {
     if (!res.headersSent) res.status(500).send("Download Error");
   } finally {
@@ -469,8 +478,6 @@ async function pushDirectToFirebase(msgId, streamLink) {
   try {
     await axios.put(pendingUrl, dataPayload);
     console.log(`🔥 [FIREBASE] Data Pending state mein push ho gaya (msgId=${msgId})`);
-    
-    // 🆕 Track timestamp for auto-cleanup
     pendingTimestamps.set(msgId, Date.now());
   } catch (e) {
     console.error("❌ [FIREBASE] Pending push error:", e.response?.data || e.message);
@@ -491,11 +498,11 @@ async function pushDirectToFirebase(msgId, streamLink) {
 }
 
 // -------------------------------------------------------------
-// 🧹 AUTO-CLEANUP: Delete Pending entries older than 4 minutes
+// 🧹 AUTO-CLEANUP: 4 minute timeout
 // -------------------------------------------------------------
 async function cleanupOldPendingEntries() {
   const now = Date.now();
-  const FOUR_MINUTES = 4 * 60 * 1000; // 240,000 ms
+  const FOUR_MINUTES = 4 * 60 * 1000;
   
   const expiredEntries = [];
   for (const [msgId, timestamp] of pendingTimestamps.entries()) {
@@ -513,13 +520,12 @@ async function cleanupOldPendingEntries() {
       console.error(`❌ [AUTO-CLEANUP] Failed to delete msgId=${msgId}:`, e.message);
     }
     
-    // Clean local trackers
     pendingTimestamps.delete(msgId);
     activeThumbRequests.delete(msgId);
     thumbPromises.delete(msgId);
   }
 }
-setInterval(cleanupOldPendingEntries, 30 * 1000); // Har 30 sec mein check
+setInterval(cleanupOldPendingEntries, 30 * 1000);
 
 // -------------------------------------------------------------
 // EVENT HANDLER
@@ -529,18 +535,24 @@ async function handleIncomingMessage(event) {
     const message = event.message;
     if (!message) return;
 
-    let chatIdStr = "";
+    let msgChatIdStr = "";
     if (message.peerId) {
-      if (message.peerId.channelId) chatIdStr = message.peerId.channelId.toString();
-      else if (message.peerId.chatId) chatIdStr = message.peerId.chatId.toString();
-      else if (message.peerId.userId) chatIdStr = message.peerId.userId.toString();
+      if (message.peerId.channelId) msgChatIdStr = message.peerId.channelId.toString();
+      else if (message.peerId.chatId) msgChatIdStr = message.peerId.chatId.toString();
+      else if (message.peerId.userId) msgChatIdStr = message.peerId.userId.toString();
     }
 
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    // 1. Source Channel Message Processing
-    if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
-      console.log(`⚡ Channel se new message aaya ID=${message.id}`);
+    // 🆕 DONO CHANNELS CHECK
+    if (sourceChatIdStrs.has(msgChatIdStr)) {
+      console.log(`⚡ Channel se new message aaya ID=${message.id} from chat=${msgChatIdStr}`);
+      
+      const currentSourceEntity = sourceEntities.get(msgChatIdStr);
+      if (!currentSourceEntity) {
+        console.error(`❌ Source entity not found for ${msgChatIdStr}`);
+        return;
+      }
 
       const hasMedia = message.media && (message.media.document || message.media.photo);
       if (!hasMedia) {
@@ -562,7 +574,7 @@ async function handleIncomingMessage(event) {
       else if (message.media && message.media.document) {
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot + AI...`);
         pushDirectToFirebase(message.id, streamLink);
-        forwardDocToTypeChecker(message.id);
+        forwardDocToTypeChecker(message.id, currentSourceEntity);
         
         const docCaption = getDocumentFileName(message) || captionText || "Document File";
         enqueueForTagging(message.id, docCaption);
@@ -577,7 +589,7 @@ async function handleIncomingMessage(event) {
 
     // 2. Reply from @P840bot
     const isFromTypeChecker = (typeCheckerBotIdStr && senderIdSync === typeCheckerBotIdStr) ||
-                             (typeCheckerBotIdStr && chatIdStr.includes(typeCheckerBotIdStr));
+                             (typeCheckerBotIdStr && msgChatIdStr.includes(typeCheckerBotIdStr));
 
     if (isFromTypeChecker) {
       const replyText = message.message || message.text || "";
@@ -622,7 +634,7 @@ async function handleIncomingMessage(event) {
 
     // 3. ChatGPT Bot Reply
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
-                         (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
+                         (chatgptBotIdStr && msgChatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
       const replyText = message.message || message.text || "";
@@ -640,7 +652,6 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      // ❌ Agar reply @ se start nahi hota → galat reply
       if (!replyText.trim().startsWith("@")) {
         console.log(`⚠️ [CHATGPT] Galat reply (@ se start nahi) msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
         
@@ -652,7 +663,7 @@ async function handleIncomingMessage(event) {
           console.error("❌ [FIREBASE] Pending delete error:", e.message);
         }
         
-        pendingTimestamps.delete(matched.msgId); // 🆕 local tracker se bhi hatao
+        pendingTimestamps.delete(matched.msgId);
         
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
         console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
@@ -666,7 +677,6 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      // ✅ Reply @ se start hota hai → ab validation karo
       const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
       const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
 
@@ -681,7 +691,7 @@ async function handleIncomingMessage(event) {
           console.error("❌ [FIREBASE] Pending delete error:", e.message);
         }
         
-        pendingTimestamps.delete(matched.msgId); // 🆕 local tracker se bhi hatao
+        pendingTimestamps.delete(matched.msgId);
         
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
         console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
@@ -695,15 +705,14 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      // 🏆 Sab sahi hai → Firebase final mein daalo
       console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
       await patchAiTagsToFirebase(matched.msgId, replyText);
       return;
     }
 
-    // 4. Screenshot Bot Reply (@screenshort17_bot)
+    // 4. Screenshot Bot Reply
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
-                                (screenshotBotIdStr && chatIdStr.includes(screenshotBotIdStr));
+                                (screenshotBotIdStr && msgChatIdStr.includes(screenshotBotIdStr));
 
     if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
@@ -740,15 +749,21 @@ async function startServer() {
     typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
     typeCheckerBotIdStr = typeCheckerEntity.id.toString();
 
-    sourceEntity = await client.getEntity(SOURCE_CHAT);
-    sourceChatIdStr = sourceEntity.id.toString();
+    // 🆕 DONO SOURCE CHANNELS LOAD
+    for (const chat of SOURCE_CHATS) {
+      const entity = await client.getEntity(chat);
+      const idStr = entity.id.toString();
+      sourceEntities.set(idStr, entity);
+      sourceChatIdStrs.add(idStr);
+      console.log(`📌 Source Loaded: ${chat} -> ${idStr}`);
+    }
 
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
     screenshotBotIdStr = screenshotEntity.id.toString();
 
     await loadTagMsgCount();
 
-    console.log(`📌 Entities Loaded: ChatGPT=${chatgptBotIdStr} | TypeChecker=${typeCheckerBotIdStr} | Source=${sourceChatIdStr}`);
+    console.log(`📌 Bots Loaded: ChatGPT=${chatgptBotIdStr} | TypeChecker=${typeCheckerBotIdStr}`);
 
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
 
@@ -765,7 +780,7 @@ async function startServer() {
       }
     });
 
-    console.log("🤖 Client Ready! Entire Workflow Synchronized.");
+    console.log("🤖 Client Ready! Multi-Source Workflow Synchronized.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
