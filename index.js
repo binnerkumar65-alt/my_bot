@@ -21,7 +21,6 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 app.use(express.json({ limit: "2mb" }));
 
-// Environment Variables Configuration
 const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
@@ -57,9 +56,7 @@ let screenshotEntity = null;
 const messageCache = new Map();
 const thumbPromises = new Map();
 const activeThumbRequests = new Map();
-
-// 🆕 Track finalized Firebase paths for late @P840bot patches
-const finalizedDocPaths = new Map(); // msgId -> {subject, chapter}
+const finalizedDocPaths = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -244,9 +241,8 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     await axios.put(finalUrl, finalPayload);
     console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
     
-    // 🆕 Track finalized path for late @P840bot patches
     finalizedDocPaths.set(msgId, { subject: subjectName, chapter: chapterName });
-    setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000); // 30 min baad clean
+    setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000);
     
     axios.delete(pendingUrl).catch(() => {});
   } catch (e) {
@@ -485,6 +481,9 @@ async function pushDirectToFirebase(msgId, streamLink) {
   }
 }
 
+// ============================================================
+// 🔥 FIXED CHATGPT HANDLER — Queue desync + pending delete fix
+// ============================================================
 async function handleIncomingMessage(event) {
   try {
     const message = event.message;
@@ -512,7 +511,6 @@ async function handleIncomingMessage(event) {
       const streamLink = `${RENDER_URL}/stream/${message.id}`;
       const captionText = message.message || message.text || "";
 
-      // 🎥 VIDEO → AI ko caption bhejo + Thumbnail + Firebase
       if (isVideoMessage(message)) {
         pushDirectToFirebase(message.id, streamLink);
         startThumbUpload(message.id, streamLink);
@@ -521,13 +519,11 @@ async function handleIncomingMessage(event) {
         enqueueForTagging(message.id, fallbackText);
         console.log(`📨 [VIDEO] msgId=${message.id} → AI ko caption bheja: "${fallbackText.substring(0, 60)}..."`);
       }
-      // 📄 DOCUMENT → @P840bot + AI ko caption bhejo (taaki chapter/lec mile)
       else if (message.media && message.media.document) {
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot + AI...`);
         pushDirectToFirebase(message.id, streamLink);
         forwardDocToTypeChecker(message.id);
         
-        // 🆕 AI ko bhi bhejo taaki chapter/lecture tag ho sake
         const docCaption = getDocumentFileName(message) || captionText || "Document File";
         enqueueForTagging(message.id, docCaption);
         console.log(`📨 [DOCUMENT] msgId=${message.id} → AI ko caption bheja: "${docCaption.substring(0, 60)}..."`);
@@ -562,7 +558,6 @@ async function handleIncomingMessage(event) {
             download_link: `${RENDER_URL}/download/${matched.msgId}` 
           });
         } catch (e) {
-          // 🆕 Agar pending nahi mila (already deleted/finalized), toh final mein patch karo
           if (e.response && e.response.status === 404) {
             const finalPath = finalizedDocPaths.get(matched.msgId);
             if (finalPath) {
@@ -585,7 +580,7 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 3. ChatGPT Bot Reply
+    // 3. ChatGPT Bot Reply — FIXED
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
@@ -594,43 +589,75 @@ async function handleIncomingMessage(event) {
       const replyClean = replyText.toLowerCase();
       const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
 
-      if (isThinking) return;
-      if (!replyText.trim().startsWith("@")) return;
-
-      const matched = pendingReplyQueue.shift();
-      if (matched) {
-        // ✅ VALIDATION: Must have Subject, Chapter, AND Lecture tag (@Lec XX)
-        const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
-        const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
-
-        if (segments.length < 3 || !hasLectureTag) {
-          console.log(`⚠️ [CHATGPT] Galat reply format msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
-          
-          // 🆕 PENDING DELETE karo Firebase se
-          const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
-          try {
-            await axios.delete(pendingUrl);
-            console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (invalid AI reply)`);
-          } catch (e) {
-            console.error("❌ [FIREBASE] Pending delete error:", e.message);
-          }
-          
-          // 🔁 Turant AI ko rules bhejo
-          sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
-          console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
-          
-          if (!isSending) {
-            processSendQueue().catch((e) => {
-              console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
-              isSending = false;
-            });
-          }
-          return;
-        }
-
-        console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
-        await patchAiTagsToFirebase(matched.msgId, replyText);
+      // 🧠 Thinking ko ignore karo — queue se mat nikalo, actual reply aayega
+      if (isThinking) {
+        console.log(`⏳ [CHATGPT] Thinking message ignore kiya.`);
+        return;
       }
+
+      // 🎯 HAMESHA queue se nikalo — chahe reply sahi ho ya galat
+      const matched = pendingReplyQueue.shift();
+      if (!matched) {
+        console.log(`⚠️ [CHATGPT] Reply aaya par pendingReplyQueue khaali thi.`);
+        return;
+      }
+
+      // ❌ Agar reply @ se start nahi hota → galat reply hai
+      if (!replyText.trim().startsWith("@")) {
+        console.log(`⚠️ [CHATGPT] Galat reply (@ se start nahi) msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
+        
+        // Pending delete karo
+        const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
+        try {
+          await axios.delete(pendingUrl);
+          console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (invalid AI reply)`);
+        } catch (e) {
+          console.error("❌ [FIREBASE] Pending delete error:", e.message);
+        }
+        
+        // Turant rule bhejo
+        sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
+        console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
+        
+        if (!isSending) {
+          processSendQueue().catch((e) => {
+            console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
+            isSending = false;
+          });
+        }
+        return;
+      }
+
+      // ✅ Reply @ se start hota hai → ab validation karo
+      const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
+      const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
+
+      if (segments.length < 3 || !hasLectureTag) {
+        console.log(`⚠️ [CHATGPT] Incomplete reply msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
+        
+        const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
+        try {
+          await axios.delete(pendingUrl);
+          console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (incomplete AI reply)`);
+        } catch (e) {
+          console.error("❌ [FIREBASE] Pending delete error:", e.message);
+        }
+        
+        sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
+        console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
+        
+        if (!isSending) {
+          processSendQueue().catch((e) => {
+            console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
+            isSending = false;
+          });
+        }
+        return;
+      }
+
+      // 🏆 Sab sahi hai → Firebase final mein daalo
+      console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
+      await patchAiTagsToFirebase(matched.msgId, replyText);
       return;
     }
 
