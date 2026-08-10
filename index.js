@@ -26,7 +26,8 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-const SOURCE_CHAT = "@YAKEEN_NEET_HINDI_2027_LEC";
+// 🔁 SOURCE CHANNEL CHANGED TO @sxhckfufig
+const SOURCE_CHAT = "@sxhckfufig";
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
@@ -110,7 +111,6 @@ let tagMsgCount = 0;
 
 async function loadTagMsgCount() {
   try {
-    // अब यह /Meta पूरे ऑब्जेक्ट को फेच करेगा जिसमें tagMsgCount एक property होगी
     const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`);
     if (res.data && typeof res.data === "object" && typeof res.data.tagMsgCount === "number") {
       tagMsgCount = res.data.tagMsgCount;
@@ -125,7 +125,6 @@ async function loadTagMsgCount() {
 }
 
 function saveTagMsgCount() {
-  // अब यह /Meta नोड के अंदर object फॉर्मेट में tagMsgCount को पैच करेगा ताकि Meta key गायब न हो
   axios
     .patch(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: tagMsgCount })
     .then(() => console.log(`🔢 [RULE-REMINDER] Counter Firebase mein save hua: ${tagMsgCount}`))
@@ -427,6 +426,7 @@ app.get("/stream/:msgId", async (req, res) => {
   }
 });
 
+// 🚫 VIDEO DOWNLOAD BLOCKED — Sirf Documents (Notes/DPP) download honge
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -436,6 +436,12 @@ app.get("/download/:msgId", async (req, res) => {
     if (!messages || !messages[0] || !messages[0].media) return res.status(404).send("Not Found");
 
     const message = messages[0];
+
+    // 🚫 Video download block
+    if (isVideoMessage(message)) {
+      return res.status(403).send("Video downloads are not allowed.");
+    }
+
     const media = message.media;
     const doc = media.document;
     const fileSize = Number(doc ? doc.size : 0);
@@ -519,24 +525,38 @@ async function handleIncomingMessage(event) {
     // 1. Source Channel Message Processing
     if (sourceEntity && (chatIdStr.includes(sourceChatIdStr) || message.chatId?.toString() === sourceChatIdStr)) {
       console.log(`⚡ Channel se new message aaya ID=${message.id}`);
-      const streamLink = `${RENDER_URL}/stream/${message.id}`;
-      
-      pushDirectToFirebase(message.id, streamLink);
 
-      const captionText = message.message || message.text || "";
-
-      if (isVideoMessage(message)) {
-        startThumbUpload(message.id, streamLink);
-      } else if (message.media && message.media.document) {
-        console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
-        forwardDocToTypeChecker(message.id);
+      // 🚫 Sirf text/link wale messages ignore karo
+      const hasMedia = message.media && (message.media.document || message.media.photo);
+      if (!hasMedia) {
+        console.log(`⏩ [IGNORE] Sirf text/link hai ID=${message.id}, ignore kar diya.`);
+        return;
       }
 
-      const fallbackText = isVideoMessage(message)
-        ? (captionText || "Media File")
-        : (getDocumentFileName(message) || captionText || "Media File");
-      
-      enqueueForTagging(message.id, fallbackText);
+      const streamLink = `${RENDER_URL}/stream/${message.id}`;
+      const captionText = message.message || message.text || "";
+
+      // 🎥 VIDEO → AI ko caption bhejo + Thumbnail + Firebase
+      if (isVideoMessage(message)) {
+        pushDirectToFirebase(message.id, streamLink);
+        startThumbUpload(message.id, streamLink);
+
+        const fallbackText = captionText || "Media File";
+        enqueueForTagging(message.id, fallbackText);
+        console.log(`📨 [VIDEO] msgId=${message.id} → AI ko caption bheja: "${fallbackText.substring(0, 60)}..."`);
+      }
+      // 📄 DOCUMENT → Sirf @P840bot ko forward karo, AI ko mat bhejo
+      else if (message.media && message.media.document) {
+        console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot...`);
+        pushDirectToFirebase(message.id, streamLink);
+        forwardDocToTypeChecker(message.id);
+        // ❌ Document ka caption AI ko nahi bhejna
+      }
+      // 🖼️ PHOTO/OTHER → Ignore
+      else {
+        console.log(`⏩ [IGNORE] Photo/Other media ID=${message.id}, ignore kar diya.`);
+      }
+
       return;
     }
 
@@ -583,6 +603,26 @@ async function handleIncomingMessage(event) {
 
       const matched = pendingReplyQueue.shift();
       if (matched) {
+        // ✅ VALIDATION: Must have Subject, Chapter, AND Lecture tag (@Lec XX)
+        const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
+        const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
+
+        if (segments.length < 3 || !hasLectureTag) {
+          console.log(`⚠️ [CHATGPT] Galat reply format msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → Ignore kar diya.`);
+          
+          // 🔁 Turant AI ko rules bhejo
+          sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
+          console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
+          
+          if (!isSending) {
+            processSendQueue().catch((e) => {
+              console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
+              isSending = false;
+            });
+          }
+          return;
+        }
+
         console.log(`🏷️ ChatGPT tags match hue msgId=${matched.msgId} se. Parsing...`);
         await patchAiTagsToFirebase(matched.msgId, replyText);
       }
