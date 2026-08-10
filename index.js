@@ -25,7 +25,7 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-const SOURCE_CHAT = "@sxhckfufig";
+const SOURCE_CHAT = "@YAKEEN_NEET_HINDI_2027_LEC";
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
 const NEW_SCREENSHOT_BOT = "@screenshort17_bot";
@@ -57,6 +57,9 @@ const messageCache = new Map();
 const thumbPromises = new Map();
 const activeThumbRequests = new Map();
 const finalizedDocPaths = new Map();
+
+// 🆕 Track pending messages with timestamp for auto-cleanup
+const pendingTimestamps = new Map(); // msgId -> timestamp (ms)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -97,7 +100,7 @@ const RULE_REMINDER_TEXT = `नियम याद दिला रहा हू
 2. अध्याय टैग (जैसे: @समतल में गति)
 3. लेक्चर नंबर (अगर टेक्स्ट में दिया हो) ➔ @Lec XX
 
-ध्यान दें: Notes या DPP की टैगिंग की ज़रूरत नहीं है। सिर्फ Subject, Chapter और Lecture No. ही टैग करें। वीडियो में कुछ भी हो जैसे oneshort हो या कुछ भी दिखे ओ तुम सिर्फ वीडियो का लेक्चर नंबर और चैप्टर नंबर ही बताना ऊपर रूल के मुताबिक बाकी सब छोड़ देना और सब्जेक्ट`;
+ध्यान दें: Notes या DPP की टैगिंग की ज़रूरत नहीं है। सिर्फ Subject, Chapter और Lecture No. ही टैग करें।`;
 
 let tagMsgCount = 0;
 
@@ -245,6 +248,9 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000);
     
     axios.delete(pendingUrl).catch(() => {});
+    
+    // 🆕 Clean up from pendingTimestamps since it's no longer pending
+    pendingTimestamps.delete(msgId);
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
@@ -463,6 +469,9 @@ async function pushDirectToFirebase(msgId, streamLink) {
   try {
     await axios.put(pendingUrl, dataPayload);
     console.log(`🔥 [FIREBASE] Data Pending state mein push ho gaya (msgId=${msgId})`);
+    
+    // 🆕 Track timestamp for auto-cleanup
+    pendingTimestamps.set(msgId, Date.now());
   } catch (e) {
     console.error("❌ [FIREBASE] Pending push error:", e.response?.data || e.message);
     return;
@@ -481,9 +490,40 @@ async function pushDirectToFirebase(msgId, streamLink) {
   }
 }
 
-// ============================================================
-// 🔥 FIXED CHATGPT HANDLER — Queue desync + pending delete fix
-// ============================================================
+// -------------------------------------------------------------
+// 🧹 AUTO-CLEANUP: Delete Pending entries older than 4 minutes
+// -------------------------------------------------------------
+async function cleanupOldPendingEntries() {
+  const now = Date.now();
+  const FOUR_MINUTES = 4 * 60 * 1000; // 240,000 ms
+  
+  const expiredEntries = [];
+  for (const [msgId, timestamp] of pendingTimestamps.entries()) {
+    if (now - timestamp > FOUR_MINUTES) {
+      expiredEntries.push(msgId);
+    }
+  }
+
+  for (const msgId of expiredEntries) {
+    const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
+    try {
+      await axios.delete(pendingUrl);
+      console.log(`🗑️ [AUTO-CLEANUP] Pending msgId=${msgId} deleted (4 min timeout)`);
+    } catch (e) {
+      console.error(`❌ [AUTO-CLEANUP] Failed to delete msgId=${msgId}:`, e.message);
+    }
+    
+    // Clean local trackers
+    pendingTimestamps.delete(msgId);
+    activeThumbRequests.delete(msgId);
+    thumbPromises.delete(msgId);
+  }
+}
+setInterval(cleanupOldPendingEntries, 30 * 1000); // Har 30 sec mein check
+
+// -------------------------------------------------------------
+// EVENT HANDLER
+// -------------------------------------------------------------
 async function handleIncomingMessage(event) {
   try {
     const message = event.message;
@@ -580,7 +620,7 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 3. ChatGPT Bot Reply — FIXED
+    // 3. ChatGPT Bot Reply
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
                          (chatgptBotIdStr && chatIdStr.includes(chatgptBotIdStr));
 
@@ -589,24 +629,21 @@ async function handleIncomingMessage(event) {
       const replyClean = replyText.toLowerCase();
       const isThinking = ["सोच...", "thinking..."].some((t) => replyClean.includes(t));
 
-      // 🧠 Thinking ko ignore karo — queue se mat nikalo, actual reply aayega
       if (isThinking) {
         console.log(`⏳ [CHATGPT] Thinking message ignore kiya.`);
         return;
       }
 
-      // 🎯 HAMESHA queue se nikalo — chahe reply sahi ho ya galat
       const matched = pendingReplyQueue.shift();
       if (!matched) {
         console.log(`⚠️ [CHATGPT] Reply aaya par pendingReplyQueue khaali thi.`);
         return;
       }
 
-      // ❌ Agar reply @ se start nahi hota → galat reply hai
+      // ❌ Agar reply @ se start nahi hota → galat reply
       if (!replyText.trim().startsWith("@")) {
         console.log(`⚠️ [CHATGPT] Galat reply (@ se start nahi) msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
         
-        // Pending delete karo
         const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
         try {
           await axios.delete(pendingUrl);
@@ -615,7 +652,8 @@ async function handleIncomingMessage(event) {
           console.error("❌ [FIREBASE] Pending delete error:", e.message);
         }
         
-        // Turant rule bhejo
+        pendingTimestamps.delete(matched.msgId); // 🆕 local tracker se bhi hatao
+        
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
         console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
         
@@ -642,6 +680,8 @@ async function handleIncomingMessage(event) {
         } catch (e) {
           console.error("❌ [FIREBASE] Pending delete error:", e.message);
         }
+        
+        pendingTimestamps.delete(matched.msgId); // 🆕 local tracker se bhi hatao
         
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
         console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
@@ -682,6 +722,9 @@ async function handleIncomingMessage(event) {
   }
 }
 
+// -------------------------------------------------------------
+// SERVER INIT
+// -------------------------------------------------------------
 async function startServer() {
   app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server on port ${PORT}`));
 
