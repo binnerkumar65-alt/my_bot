@@ -221,6 +221,7 @@ async function forwardDocToTypeChecker(messageId, fromPeer) {
   }
 }
 
+// ⚡ FAST UPDATE - ChatGPT रिस्पॉन्स आते ही तुरंत डाटा ट्रांसफर और Pending सफाई
 async function patchAiTagsToFirebase(msgId, replyText) {
   const segments = replyText.split("@").map((s) => s.trim()).filter(Boolean);
 
@@ -265,17 +266,18 @@ async function patchAiTagsToFirebase(msgId, replyText) {
   const finalUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(subjectName)}/${encodeURIComponent(chapterName)}/${msgId}.json`;
 
   try {
+    // 1. सही जगह पर डाटा तुरंत सेव करो
     await axios.put(finalUrl, finalPayload);
-    console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
+    console.log(`🏷️ [FIREBASE] Final entry fast updated: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
 
-    // Path store kar liya taaki thumnail upload late hone par yahan patch ho
+    // 2. ट्रैक में रखो ताकि थंबनेल बाद में आने पर भी इसी पाथ पर पैच हो
     finalizedDocPaths.set(msgId, { subject: subjectName, chapter: chapterName });
     setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000);
 
-    // ✅ Pending Node ko complete delete kar do
+    // 3. Pending नोड को तुरंत डिलीट कर दो
     await axios.delete(pendingUrl);
     pendingTimestamps.delete(msgId);
-    console.log(`🗑️ [FIREBASE] Successfully deleted Pending entry for msgId=${msgId}`);
+    console.log(`🗑️ [FIREBASE] Pending node cleared for msgId=${msgId}`);
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
@@ -385,7 +387,7 @@ function startThumbUpload(msgId, streamLink) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
         console.log(`🔗 [ARCHIVE] Direct Link for msgId=${msgId}: ${result}`);
 
-        // ✅ Agar Final node create ho chuki hai, to wahan patch karein
+        // अगर फाइनल नोड पहले ही बन चुका है, तो थंबनेल को सीधे वहां अपडेट करो
         const finalPath = finalizedDocPaths.get(msgId);
         if (finalPath && result) {
           try {
@@ -527,7 +529,6 @@ async function pushDirectToFirebase(msgId, streamLink) {
 
   if (thumbPromises.has(msgId)) {
     const thumbUrl = await thumbPromises.get(msgId);
-    // ✅ Check karein ki file Final ho chuki hai ya nahi
     if (thumbUrl && !finalizedDocPaths.has(msgId)) {
       try {
         await axios.patch(pendingUrl, { thumb_link: thumbUrl });
@@ -540,7 +541,7 @@ async function pushDirectToFirebase(msgId, streamLink) {
 }
 
 // -------------------------------------------------------------
-// 🧹 AUTO-CLEANUP: 4 minute timeout & Firebase sync
+// 🧹 AUTO-CLEANUP: 4 मिनट से पुरानी हर पेंडिंग एंट्री को पक्का डिलीट करेगा
 // -------------------------------------------------------------
 async function cleanupOldPendingEntries() {
   const now = Date.now();
@@ -554,10 +555,11 @@ async function cleanupOldPendingEntries() {
       for (const [msgIdStr, item] of Object.entries(pendingData)) {
         const itemTimestamp = (item && item.timestamp) ? item.timestamp : pendingTimestamps.get(parseInt(msgIdStr));
 
+        // अगर 4 मिनट से पुरानी है या टाइमस्टैम्प गायब है
         if (!itemTimestamp || (now - itemTimestamp > FOUR_MINUTES)) {
           const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgIdStr}.json`;
           await axios.delete(pendingUrl);
-          console.log(`🗑️ [AUTO-CLEANUP] Pending msgId=${msgIdStr} permanently deleted (4 min timeout)`);
+          console.log(`🗑️ [AUTO-CLEANUP] Stale Pending msgId=${msgIdStr} deleted permanently (4 min timeout)`);
           
           const msgIdNum = parseInt(msgIdStr);
           pendingTimestamps.delete(msgIdNum);
@@ -569,7 +571,7 @@ async function cleanupOldPendingEntries() {
       }
     }
   } catch (e) {
-    console.error("❌ [AUTO-CLEANUP] Sync cleanup error:", e.message);
+    console.error("❌ [AUTO-CLEANUP] Error during deletion cycle:", e.message);
   }
 }
 setInterval(cleanupOldPendingEntries, 30 * 1000);
