@@ -8,6 +8,7 @@ process.on('uncaughtException', (err) => {
 
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
+const { NewMessage } = require("telegram/events");
 const express = require("express");
 const axios = require("axios");
 const bigInt = require("big-integer");
@@ -17,7 +18,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 
-// 🎬 FFMPEG PATH
+// 🎬 FFMPEG PATH Setup
 let ffmpegPath = "ffmpeg";
 try {
   ffmpegPath = require("ffmpeg-static") || "ffmpeg";
@@ -55,13 +56,15 @@ const client = new TelegramClient(stringSession, apiId, apiHash, {
 
 let chatgptEntity = null;
 let typeCheckerEntity = null;
+let screenshotEntity = null;
 
+const sourceEntities = new Map();
 const videoLocationCache = new Map();
 const messageCache = new Map();
 const chatgptSentToOriginal = new Map();
 const typeCheckerSentToOriginal = new Map();
 
-// 📂 DIRS SETUPS
+// 📁 DIRECTORIES SETUP
 const VIDEO_CACHE_DIR = path.join(os.tmpdir(), 'video-chunk-cache');
 const TRANSCODE_DIR = path.join(os.tmpdir(), "video-transcode-360p");
 
@@ -70,7 +73,7 @@ const TRANSCODE_DIR = path.join(os.tmpdir(), "video-transcode-360p");
 });
 
 // ============================================================
-// 🚨 🔥 30-SECOND SUPER AGGRESSIVE DISK & RAM CLEANER 🔥
+// 🚨 🔥 30-SECOND AGGRESSIVE DISK CLEANUP (FOR ALL STALE/FAILED FILES)
 // ============================================================
 function forceCleanAllTempFiles() {
   const now = Date.now();
@@ -86,10 +89,8 @@ function forceCleanAllTempFiles() {
         fs.stat(filePath, (statErr, stats) => {
           if (statErr) return;
 
-          // 1. अगर फ़ाइल 30 सेकेंड से पुरानी है, चाहे प्रोसेस सफल हुआ हो या क्रैश/फ़ेल — डिलीट कर दो
+          // 30 sec se purani file ya failed temp files ko turant uda do
           const isStale = (now - stats.mtimeMs) > 30 * 1000;
-          
-          // 2. या अगर फ़ाइल अधूरी/फ़ेल ट्रांसकोड की अस्थायी फ़ाइल है (.tmp, transcoded_, etc)
           const isTempFile = file.startsWith("transcoded_") || 
                              file.startsWith("transcodesrc_") || 
                              file.startsWith("thumbsrc_") || 
@@ -99,7 +100,7 @@ function forceCleanAllTempFiles() {
           if (isStale || isTempFile) {
             fs.unlink(filePath, (unlinkErr) => {
               if (!unlinkErr) {
-                console.log(`🗑️ [DISK-CLEANER 30s] Purani/Failed file delete ho gayi: ${file}`);
+                console.log(`🗑️ [30s DISK-CLEANER] Auto Deleted: ${file}`);
               }
             });
           }
@@ -108,31 +109,14 @@ function forceCleanAllTempFiles() {
     });
   });
 
-  // Garbage collection (RAM clear)
-  if (global.gc) {
-    global.gc();
-  }
+  if (global.gc) global.gc();
 }
-
-// ⏱️ हर 30 सेकेंड में डिस्क खाली करने का कोड
 setInterval(forceCleanAllTempFiles, 30 * 1000);
 
 // ============================================================
-// 🔢 RESET COUNTER API (0 से शुरुआत करने के लिए)
+// 🔢 COUNTER & RESET SYSTEM
 // ============================================================
 let tagMsgCount = 0;
-
-// आप ब्राउज़र में https://my-bot-kgrk.onrender.com/reset-counter खोलकर काउंटर को 0 कर सकते हैं
-app.get("/reset-counter", async (req, res) => {
-  try {
-    tagMsgCount = 0;
-    await axios.put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: 0 });
-    console.log("🔄 [RESET] Counter Firebase aur Bot mein 0 kar diya gaya.");
-    res.send("✅ Counter and ID history successfully reset to 0!");
-  } catch (e) {
-    res.status(500).send("❌ Reset failed: " + e.message);
-  }
-});
 
 async function loadTagMsgCount() {
   try {
@@ -142,15 +126,80 @@ async function loadTagMsgCount() {
     } else {
       tagMsgCount = 0;
     }
+    console.log(`🔢 [RULE-REMINDER] Counter Loaded: ${tagMsgCount}`);
   } catch (e) {
     tagMsgCount = 0;
   }
 }
 
+app.get("/reset-counter", async (req, res) => {
+  try {
+    tagMsgCount = 0;
+    await axios.put(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Meta.json`, { tagMsgCount: 0 });
+    console.log("🔄 [RESET] Counter Firebase aur Bot me 0 ho gaya hai.");
+    res.send("✅ Counter & History successfully reset to 0!");
+  } catch (e) {
+    res.status(500).send("❌ Reset failed: " + e.message);
+  }
+});
+
 // ============================================================
-// STREAM ENDPOINT & BOT SERVER
+// 📡 TELEGRAM CHANNEL LISTENER (मैसेज उठाने का मेन लॉजिक)
 // ============================================================
-app.get("/", (req, res) => res.send("Bot Active - Auto 30s Disk Cleaning Enabled"));
+async function initTelegramListeners() {
+  try {
+    chatgptEntity = await client.getEntity(CHATGPT_BOT).catch(() => null);
+    typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT).catch(() => null);
+    screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT).catch(() => null);
+
+    for (const chatName of SOURCE_CHATS) {
+      try {
+        const entity = await client.getEntity(chatName);
+        const chatIdStr = entity.id.toString();
+        sourceEntities.set(chatIdStr, entity);
+        console.log(`✅ [CHANNEL-CONNECTED] Listening to ${chatName} (ID: ${chatIdStr})`);
+      } catch (err) {
+        console.error(`❌ Channel connect error (${chatName}):`, err.message);
+      }
+    }
+
+    // New Message Event
+    client.addEventHandler(async (event) => {
+      const message = event.message;
+      if (!message) return;
+
+      const chatIdStr = message.peerId?.channelId?.toString() || message.peerId?.chatId?.toString();
+      
+      // Check if message is from configured channels
+      if (sourceEntities.has(chatIdStr)) {
+        const msgId = message.id;
+        console.log(`📩 [NEW-MESSAGE] Channel se message aaya! ID=${msgId}`);
+
+        videoLocationCache.set(msgId, chatIdStr);
+        messageCache.set(msgId, message);
+
+        // Firebase Pending Node me entry
+        const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
+        const payload = {
+          msg_id: msgId,
+          stream_link: `${RENDER_URL}/stream/${msgId}`,
+          timestamp: { ".sv": "timestamp" },
+          content_type: "@video"
+        };
+
+        axios.put(pendingUrl, payload).catch(e => console.error("Firebase write err:", e.message));
+      }
+    }, new NewMessage({}));
+
+  } catch (e) {
+    console.error("❌ Listener Init Error:", e.message);
+  }
+}
+
+// ============================================================
+// 🚀 EXPRESS ROUTES
+// ============================================================
+app.get("/", (req, res) => res.send("Bot Active - Channel Listening ON & 30s Disk Cleanup Ready"));
 
 app.get("/stream/:msgId", async (req, res) => {
   const msgId = parseInt(req.params.msgId);
@@ -162,16 +211,18 @@ app.get("/stream/:msgId", async (req, res) => {
     return fs.createReadStream(transcodedPath).pipe(res);
   }
 
-  return res.status(404).send("Stream source currently initializing or cleaned up.");
+  return res.status(404).send("Video file missing or auto-cleaned.");
 });
 
+// START SERVER & CONNECT TELEGRAM
 app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   await loadTagMsgCount();
   try {
     await client.start();
     console.log("🤖 Telegram Client Connected!");
+    await initTelegramListeners();
   } catch (err) {
-    console.error("❌ Telegram Client connection failed:", err.message);
+    console.error("❌ Telegram connection failed:", err.message);
   }
 });
