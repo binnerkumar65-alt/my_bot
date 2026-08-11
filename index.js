@@ -67,6 +67,10 @@ let screenshotEntity = null;
 const sourceEntities = new Map(); // chatIdStr -> entity
 const sourceChatIdStrs = new Set();
 
+// 🆕 JUGAAD #2: msgId -> chatIdStr cache — stream request pe har baar dono channels
+// mein loop-search nahi karna padega, seedha pata chal jayega video kaunse channel mein hai
+const videoLocationCache = new Map(); // msgId -> chatIdStr
+
 const messageCache = new Map();
 const thumbPromises = new Map();
 const finalizedDocPaths = new Map();
@@ -471,7 +475,9 @@ async function saveChunkCache(msgId, start, end, buffer) {
 }
 
 function cleanupVideoCache() {
-  const TWO_MINUTES = 2 * 60 * 1000;
+  // 🆕 2min se badha kar 10min kiya — taaki PREWARM kiya hua chunk AI-tagging
+  // pipeline complete hone se pehle expire na ho jaaye
+  const TEN_MINUTES = 10 * 60 * 1000;
   const now = Date.now();
   fs.readdir(VIDEO_CACHE_DIR, (err, files) => {
     if (err) return;
@@ -479,7 +485,7 @@ function cleanupVideoCache() {
     files.forEach(file => {
       const filePath = path.join(VIDEO_CACHE_DIR, file);
       fs.stat(filePath, (err, stats) => {
-        if (!err && (now - stats.mtimeMs > TWO_MINUTES)) {
+        if (!err && (now - stats.mtimeMs > TEN_MINUTES)) {
           fs.unlink(filePath, () => {});
           deleted++;
         }
@@ -599,6 +605,47 @@ async function startBackgroundTranscode(msgId, message) {
 app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline + Chunk Cache + 360p Transcode"));
 
 // ============================================================
+// 🆕 JUGAAD #2: PREWARM — video aate hi pehla chunk turant cache mein daal do
+// ============================================================
+// Player play dabate hi pehle ~1.5MB (moov atom + start) maangta hai.
+// Agar ye pehle se cache mein pada ho, to first request TURANT (0ms Telegram-wait) serve hoga —
+// user ko "buffering" ka wait nahi karna padega. Ye AI-tagging pipeline ke parallel chalta hai,
+// isiliye by the time link kisi ko milta hai, cache already garam ho chuka hota hai.
+const PREWARM_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
+
+async function prewarmStream(msgId, entity, media) {
+  const fileSize = Number(media.document ? media.document.size : 0);
+  if (!fileSize) return;
+
+  const end = Math.min(PREWARM_BYTES - 1, fileSize - 1);
+  const cacheKey = `${msgId}_0_${end}`;
+
+  try {
+    if (inflightChunks.has(cacheKey)) return;
+
+    const existing = await getCachedChunk(msgId, 0, end);
+    if (existing) return; // already warm
+
+    inflightChunks.add(cacheKey);
+    console.log(`🔥 [PREWARM] msgId=${msgId} ka pehla ${(end + 1)} bytes cache kar rahe hain...`);
+
+    const chunks = [];
+    const stream = client.iterDownload({ file: media, offset: bigInt(0), limit: end + 1 });
+    for await (const chunk of stream) chunks.push(chunk);
+
+    const buffer = Buffer.concat(chunks);
+    if (buffer.length) {
+      await saveChunkCache(msgId, 0, end, buffer);
+      console.log(`✅ [PREWARM] msgId=${msgId} cache READY — ab first click instant play hoga.`);
+    }
+  } catch (e) {
+    console.error(`❌ [PREWARM] Failed msgId=${msgId}:`, e.message);
+  } finally {
+    inflightChunks.delete(cacheKey);
+  }
+}
+
+// ============================================================
 // 🆕 STREAM: Chunk Cache ke saath
 // ============================================================
 app.get("/stream/:msgId", async (req, res) => {
@@ -638,9 +685,18 @@ app.get("/stream/:msgId", async (req, res) => {
       return;
     }
 
-    for (const [chatIdStr, entity] of sourceEntities) {
+    // 🆕 JUGAAD #2: agar iss video ka channel pehle se pata hai, seedha wahi query karo
+    // (dono channels mein loop-search karke time waste nahi karna)
+    const knownChatIdStr = videoLocationCache.get(msgId);
+    const entitiesToTry = knownChatIdStr && sourceEntities.has(knownChatIdStr)
+      ? [[knownChatIdStr, sourceEntities.get(knownChatIdStr)]]
+      : Array.from(sourceEntities.entries());
+
+    for (const [chatIdStr, entity] of entitiesToTry) {
       const messages = await client.getMessages(entity, { ids: msgId });
       if (!messages || !messages[0] || !messages[0].media) continue;
+
+      videoLocationCache.set(msgId, chatIdStr); // 🆕 agli baar ke liye yaad rakho
 
       const message = messages[0];
       const media = message.media;
@@ -922,9 +978,11 @@ async function handleIncomingMessage(event) {
       const captionText = message.message || message.text || "";
 
       if (isVideoMessage(message)) {
+        videoLocationCache.set(message.id, msgChatIdStr); // 🆕 stream lookup ke liye yaad rakho
         pushDirectToFirebase(message.id, streamLink);
         startThumbUpload(message.id, streamLink);
         startBackgroundTranscode(message.id, message); // 🆕 background 360p transcode shuru
+        prewarmStream(message.id, currentSourceEntity, message.media); // 🆕 pehla chunk turant cache karo
 
         const fallbackText = captionText || "Media File";
         enqueueForTagging(message.id, fallbackText);
