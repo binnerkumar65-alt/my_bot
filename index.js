@@ -25,7 +25,6 @@ const apiId = parseInt(process.env.API_ID || "0");
 const apiHash = process.env.API_HASH || "";
 const stringSession = new StringSession(process.env.SESSION_STRING || "");
 
-// 🆕 DONO CHANNELS SUPPORT
 const SOURCE_CHATS = ["@sxhckfufig", "@YAKEEN_NEET_HINDI_2027_LEC"];
 const CHATGPT_BOT = "@chatgpt";
 const TYPE_CHECKER_BOT = "@P840bot";
@@ -52,8 +51,7 @@ let typeCheckerEntity = null;
 let screenshotBotIdStr = null;
 let screenshotEntity = null;
 
-// 🆕 Multiple source channels tracking
-const sourceEntities = new Map(); // chatIdStr -> entity
+const sourceEntities = new Map();
 const sourceChatIdStrs = new Set();
 
 const messageCache = new Map();
@@ -61,20 +59,17 @@ const thumbPromises = new Map();
 const finalizedDocPaths = new Map();
 const pendingTimestamps = new Map();
 
-// 🆕 THUMBNAIL FIFO QUEUE (pehle wala Map hata diya — ab queue se match hoga)
-const screenshotRequestQueue = []; // FIFO: msgIds waiting for screenshot
-const screenshotResults = new Map(); // msgId -> photoMessage
+const screenshotRequestQueue = [];
+const screenshotResults = new Map();
 
-// 🆕 CORRELATION MAPS (replyTo se exact match ke liye)
-const chatgptSentToOriginal = new Map(); // sentMsgId -> originalMsgId
-const typeCheckerSentToOriginal = new Map(); // forwardedMsgId -> originalMsgId
+const chatgptSentToOriginal = new Map();
+const typeCheckerSentToOriginal = new Map();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function clearMemory() {
   try {
     messageCache.clear();
-    // Stale correlation entries clean karo
     if (chatgptSentToOriginal.size > 200) {
       const keys = Array.from(chatgptSentToOriginal.keys()).slice(0, chatgptSentToOriginal.size - 200);
       keys.forEach(k => chatgptSentToOriginal.delete(k));
@@ -246,8 +241,6 @@ async function patchAiTagsToFirebase(msgId, replyText) {
   }
 
   const contentType = staged.content_type || "@other";
-
-  // 🆕 THUMB KA WAIT NAHI KARENGE — agar pehle se pending mein hai to use karo, warna blank
   let thumbUrl = staged.thumb_link || "";
 
   const lecNum = lecTag.replace(/^@?Lec\s*/i, "").trim();
@@ -260,7 +253,7 @@ async function patchAiTagsToFirebase(msgId, replyText) {
       ? `${RENDER_URL}/download/${msgId}`
       : "",
     thumb_link: thumbUrl,
-    timestamp: staged.timestamp || { ".sv": "timestamp" },
+    timestamp: staged.timestamp || Date.now(),
     subject: subjectName,
     chapter: chapterName,
     content_type: contentType,
@@ -275,11 +268,14 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     await axios.put(finalUrl, finalPayload);
     console.log(`🏷️ [FIREBASE] Final entry likh diya: ${subjectName} > ${chapterName} > ${contentType} (msgId=${msgId})`);
 
+    // Path store kar liya taaki thumnail upload late hone par yahan patch ho
     finalizedDocPaths.set(msgId, { subject: subjectName, chapter: chapterName });
     setTimeout(() => finalizedDocPaths.delete(msgId), 30 * 60 * 1000);
 
-    axios.delete(pendingUrl).catch(() => {});
+    // ✅ Pending Node ko complete delete kar do
+    await axios.delete(pendingUrl);
     pendingTimestamps.delete(msgId);
+    console.log(`🗑️ [FIREBASE] Successfully deleted Pending entry for msgId=${msgId}`);
   } catch (e) {
     console.error("❌ [FIREBASE] Final write error:", e.response?.data || e.message);
   }
@@ -290,7 +286,7 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
 
   try {
     screenshotRequestQueue.push(msgId);
-    screenshotResults.delete(msgId); // clean stale
+    screenshotResults.delete(msgId);
 
     await client.sendMessage(screenshotEntity, { message: streamLink });
     console.log(`📤 [THUMB-BOT] (msgId=${msgId}) @screenshort17_bot ko URL bhej diya: ${streamLink}`);
@@ -303,7 +299,6 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
 
     const photoMsg = screenshotResults.get(msgId);
     screenshotResults.delete(msgId);
-    // Remove from queue if still present (timeout case)
     const idx = screenshotRequestQueue.indexOf(msgId);
     if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
 
@@ -390,7 +385,7 @@ function startThumbUpload(msgId, streamLink) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
         console.log(`🔗 [ARCHIVE] Direct Link for msgId=${msgId}: ${result}`);
 
-        // 🆕 Agar final entry already ban chuki hai, to thumb usme bhi patch karo
+        // ✅ Agar Final node create ho chuki hai, to wahan patch karein
         const finalPath = finalizedDocPaths.get(msgId);
         if (finalPath && result) {
           try {
@@ -414,7 +409,6 @@ function startThumbUpload(msgId, streamLink) {
 
 app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline Integrated"));
 
-// 🆕 STREAM: Dono channels mein se dhoondhega
 app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -454,10 +448,9 @@ app.get("/stream/:msgId", async (req, res) => {
         }
         res.end();
       }
-      return; // Message mil gaya, return
+      return;
     }
 
-    // Kisi channel mein nahi mila
     res.status(404).send("Not Found");
   } catch (e) {
     if (!res.headersSent) res.status(500).send("Streaming Error");
@@ -466,7 +459,6 @@ app.get("/stream/:msgId", async (req, res) => {
   }
 });
 
-// 🆕 DOWNLOAD: Dono channels mein se dhoondhega
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -503,7 +495,7 @@ app.get("/download/:msgId", async (req, res) => {
         if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
       }
       res.end();
-      return; // Message mil gaya, return
+      return;
     }
 
     res.status(404).send("Not Found");
@@ -521,7 +513,7 @@ async function pushDirectToFirebase(msgId, streamLink) {
     msg_id: msgId,
     stream_link: streamLink,
     status: "pending",
-    timestamp: { ".sv": "timestamp" },
+    timestamp: Date.now(),
   };
 
   try {
@@ -535,7 +527,8 @@ async function pushDirectToFirebase(msgId, streamLink) {
 
   if (thumbPromises.has(msgId)) {
     const thumbUrl = await thumbPromises.get(msgId);
-    if (thumbUrl) {
+    // ✅ Check karein ki file Final ho chuki hai ya nahi
+    if (thumbUrl && !finalizedDocPaths.has(msgId)) {
       try {
         await axios.patch(pendingUrl, { thumb_link: thumbUrl });
         console.log(`✅ [FIREBASE] thumb_link Pending mein patch hua (msgId=${msgId})`);
@@ -547,33 +540,36 @@ async function pushDirectToFirebase(msgId, streamLink) {
 }
 
 // -------------------------------------------------------------
-// 🧹 AUTO-CLEANUP: 4 minute timeout
+// 🧹 AUTO-CLEANUP: 4 minute timeout & Firebase sync
 // -------------------------------------------------------------
 async function cleanupOldPendingEntries() {
   const now = Date.now();
   const FOUR_MINUTES = 4 * 60 * 1000;
 
-  const expiredEntries = [];
-  for (const [msgId, timestamp] of pendingTimestamps.entries()) {
-    if (now - timestamp > FOUR_MINUTES) {
-      expiredEntries.push(msgId);
-    }
-  }
+  try {
+    const res = await axios.get(`${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending.json`);
+    const pendingData = res.data;
 
-  for (const msgId of expiredEntries) {
-    const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
-    try {
-      await axios.delete(pendingUrl);
-      console.log(`🗑️ [AUTO-CLEANUP] Pending msgId=${msgId} deleted (4 min timeout)`);
-    } catch (e) {
-      console.error(`❌ [AUTO-CLEANUP] Failed to delete msgId=${msgId}:`, e.message);
-    }
+    if (pendingData && typeof pendingData === "object") {
+      for (const [msgIdStr, item] of Object.entries(pendingData)) {
+        const itemTimestamp = (item && item.timestamp) ? item.timestamp : pendingTimestamps.get(parseInt(msgIdStr));
 
-    pendingTimestamps.delete(msgId);
-    const idx = screenshotRequestQueue.indexOf(msgId);
-    if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
-    screenshotResults.delete(msgId);
-    thumbPromises.delete(msgId);
+        if (!itemTimestamp || (now - itemTimestamp > FOUR_MINUTES)) {
+          const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgIdStr}.json`;
+          await axios.delete(pendingUrl);
+          console.log(`🗑️ [AUTO-CLEANUP] Pending msgId=${msgIdStr} permanently deleted (4 min timeout)`);
+          
+          const msgIdNum = parseInt(msgIdStr);
+          pendingTimestamps.delete(msgIdNum);
+          const idx = screenshotRequestQueue.indexOf(msgIdNum);
+          if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
+          screenshotResults.delete(msgIdNum);
+          thumbPromises.delete(msgIdNum);
+        }
+      }
+    }
+  } catch (e) {
+    console.error("❌ [AUTO-CLEANUP] Sync cleanup error:", e.message);
   }
 }
 setInterval(cleanupOldPendingEntries, 30 * 1000);
@@ -595,13 +591,11 @@ async function handleIncomingMessage(event) {
 
     const senderIdSync = message.senderId ? message.senderId.toString() : "";
 
-    // 🔍 DEBUG LOG: Har message ka source dikhayega
     if (msgChatIdStr) {
       const isKnown = sourceChatIdStrs.has(msgChatIdStr);
-      console.log(`🔍 [DEBUG] msgId=${message.id} | chatId=${msgChatIdStr} | knownSource=${isKnown} | sources=[${Array.from(sourceChatIdStrs).join(", ")}]`);
+      console.log(`🔍 [DEBUG] msgId=${message.id} | chatId=${msgChatIdStr} | knownSource=${isKnown}`);
     }
 
-    // 🆕 DONO CHANNELS CHECK
     if (sourceChatIdStrs.has(msgChatIdStr)) {
       console.log(`⚡ Channel se new message aaya ID=${message.id} from chat=${msgChatIdStr}`);
 
@@ -644,9 +638,8 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 2. Reply from @P840bot
     const isFromTypeChecker = (typeCheckerBotIdStr && senderIdSync === typeCheckerBotIdStr) ||
-                             (typeCheckerBotIdStr && msgChatIdStr.includes(typeCheckerBotIdStr));
+                              (typeCheckerBotIdStr && msgChatIdStr.includes(typeCheckerBotIdStr));
 
     if (isFromTypeChecker) {
       const replyText = message.message || message.text || "";
@@ -656,7 +649,6 @@ async function handleIncomingMessage(event) {
       if (replyText.includes("@dpp")) detectedType = "@dpp";
       else if (replyText.includes("@notes")) detectedType = "@notes";
 
-      // 🆕 replyTo se correlate karo
       let matched = null;
       const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
       if (replyToId && typeCheckerSentToOriginal.has(replyToId)) {
@@ -670,9 +662,6 @@ async function handleIncomingMessage(event) {
       }
       if (!matched) {
         matched = pendingTypeQueue.shift();
-        if (matched) {
-          console.log(`⚠️ [TYPE-CHECKER] replyTo missing, using FIFO fallback for msgId=${matched.msgId}`);
-        }
       }
 
       if (matched) {
@@ -707,9 +696,8 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 3. ChatGPT Bot Reply
     const isFromChatGPT = (chatgptBotIdStr && senderIdSync === chatgptBotIdStr) ||
-                         (chatgptBotIdStr && msgChatIdStr.includes(chatgptBotIdStr));
+                          (chatgptBotIdStr && msgChatIdStr.includes(chatgptBotIdStr));
 
     if (isFromChatGPT) {
       const replyText = message.message || message.text || "";
@@ -721,7 +709,6 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      // 🆕 replyTo se correlate karo
       let matched = null;
       const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
       if (replyToId && chatgptSentToOriginal.has(replyToId)) {
@@ -735,9 +722,6 @@ async function handleIncomingMessage(event) {
       }
       if (!matched) {
         matched = pendingReplyQueue.shift();
-        if (matched) {
-          console.log(`⚠️ [CHATGPT] replyTo missing, using FIFO fallback for msgId=${matched.msgId}`);
-        }
       }
 
       if (!matched) {
@@ -746,27 +730,15 @@ async function handleIncomingMessage(event) {
       }
 
       if (!replyText.trim().startsWith("@")) {
-        console.log(`⚠️ [CHATGPT] Galat reply (@ se start nahi) msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
-
+        console.log(`⚠️ [CHATGPT] Galat reply msgId=${matched.msgId} → IGNORE + DELETE PENDING`);
         const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
         try {
           await axios.delete(pendingUrl);
-          console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (invalid AI reply)`);
-        } catch (e) {
-          console.error("❌ [FIREBASE] Pending delete error:", e.message);
-        }
-
+        } catch (e) {}
         pendingTimestamps.delete(matched.msgId);
 
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
-        console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
-
-        if (!isSending) {
-          processSendQueue().catch((e) => {
-            console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
-            isSending = false;
-          });
-        }
+        if (!isSending) processSendQueue().catch(() => { isSending = false; });
         return;
       }
 
@@ -774,27 +746,15 @@ async function handleIncomingMessage(event) {
       const hasLectureTag = segments.length >= 3 && /^lec/i.test(segments[2]);
 
       if (segments.length < 3 || !hasLectureTag) {
-        console.log(`⚠️ [CHATGPT] Incomplete reply msgId=${matched.msgId}: "${replyText.substring(0, 80)}..." → IGNORE + DELETE PENDING`);
-
+        console.log(`⚠️ [CHATGPT] Incomplete reply msgId=${matched.msgId} → IGNORE + DELETE PENDING`);
         const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
         try {
           await axios.delete(pendingUrl);
-          console.log(`🗑️ [FIREBASE] Pending entry DELETED for msgId=${matched.msgId} (incomplete AI reply)`);
-        } catch (e) {
-          console.error("❌ [FIREBASE] Pending delete error:", e.message);
-        }
-
+        } catch (e) {}
         pendingTimestamps.delete(matched.msgId);
 
         sendQueue.push({ msgId: null, text: RULE_REMINDER_TEXT, isReminder: true });
-        console.log(`🔁 [RULE-REMINDER] AI se galat jawab aaya - TURANT rules bhej rahe hain.`);
-
-        if (!isSending) {
-          processSendQueue().catch((e) => {
-            console.error("❌ [TAG-QUEUE] processSendQueue error:", e);
-            isSending = false;
-          });
-        }
+        if (!isSending) processSendQueue().catch(() => { isSending = false; });
         return;
       }
 
@@ -803,9 +763,8 @@ async function handleIncomingMessage(event) {
       return;
     }
 
-    // 4. Screenshot Bot Reply
     const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) ||
-                                (screenshotBotIdStr && msgChatIdStr.includes(screenshotBotIdStr));
+                                 (screenshotBotIdStr && msgChatIdStr.includes(screenshotBotIdStr));
 
     if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
@@ -813,8 +772,6 @@ async function handleIncomingMessage(event) {
         if (targetMsgId) {
           screenshotResults.set(targetMsgId, message);
           console.log(`📸 [THUMB-BOT] Screenshot successfully matched for msgId=${targetMsgId}`);
-        } else {
-          console.log(`⚠️ [THUMB-BOT] Unexpected photo received, no pending request.`);
         }
       }
       return;
@@ -836,10 +793,9 @@ async function startServer() {
   try {
     await client.connect();
 
-    // 🆕 BOT IDENTITY LOG
     try {
       const me = await client.getMe();
-      console.log(`🤖 [BOT-IDENTITY] Account: @${me.username || 'no-username'} | ID=${me.id} | Name=${me.firstName}${me.lastName ? ' ' + me.lastName : ''}`);
+      console.log(`🤖 [BOT-IDENTITY] Account: @${me.username || 'no-username'} | ID=${me.id}`);
     } catch (e) {
       console.error("❌ [BOT-IDENTITY] getMe failed:", e.message);
     }
@@ -850,63 +806,32 @@ async function startServer() {
     typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
     typeCheckerBotIdStr = typeCheckerEntity.id.toString();
 
-    // 🆕 DONO SOURCE CHANNELS LOAD + ACCESS CHECK
-    console.log(`📡 [CHANNEL-CHECK] ${SOURCE_CHATS.length} channels load kar raha hai...`);
-    for (const chat of SOURCE_CHATS) {
-      try {
-        const entity = await client.getEntity(chat);
-        const idStr = bigInt(entity.id).toString();
-        sourceEntities.set(idStr, entity);
-        sourceChatIdStrs.add(idStr);
-        console.log(`📌 [CHANNEL-LOAD] ${chat} -> ID=${idStr} | Title="${entity.title || 'N/A'}"`);
-
-        // 🆕 ACCESS TEST: Last message fetch karke check karo
-        try {
-          const testMsgs = await client.getMessages(entity, { limit: 1 });
-          if (testMsgs && testMsgs.length > 0 && testMsgs[0]) {
-            console.log(`✅ [CHANNEL-ACCESS] ${chat} CONNECTED! | LastMsgID=${testMsgs[0].id} | Access=OK`);
-          } else {
-            console.log(`⚠️ [CHANNEL-ACCESS] ${chat} Connected but NO MESSAGES found (empty channel?)`);
-          }
-        } catch (accessErr) {
-          console.error(`❌ [CHANNEL-ACCESS] ${chat} FAILED! | Error: ${accessErr.message}`);
-          console.error(`   ➜ Reason: Bot account channel ka member nahi hai ya access nahi hai.`);
-          console.error(`   ➜ Fix: Bot account (@${me?.username || 'unknown'}) ko channel mein add/join karwao.`);
-        }
-      } catch (e) {
-        console.error(`❌ [CHANNEL-LOAD] ${chat} FAILED! | Error: ${e.message}`);
-      }
-    }
-
-    // Final summary
-    console.log(`📊 [CHANNEL-SUMMARY] Total Loaded: ${sourceEntities.size}/${SOURCE_CHATS.length}`);
-    console.log(`📊 [CHANNEL-SUMMARY] Active IDs: [${Array.from(sourceChatIdStrs).join(", ")}]`);
-
     screenshotEntity = await client.getEntity(NEW_SCREENSHOT_BOT);
     screenshotBotIdStr = screenshotEntity.id.toString();
 
+    for (const chat of SOURCE_CHATS) {
+      try {
+        const entity = await client.getEntity(chat);
+        let idStr = "";
+        if (entity.id) idStr = entity.id.toString();
+        
+        if (idStr) {
+          sourceEntities.set(idStr, entity);
+          sourceChatIdStrs.add(idStr);
+          console.log(`✅ [CHANNEL] Registered: ${chat} (ID=${idStr})`);
+        }
+      } catch (err) {
+        console.error(`❌ [CHANNEL] Failed to load ${chat}:`, err.message);
+      }
+    }
+
     await loadTagMsgCount();
 
-    console.log(`📌 Bots Loaded: ChatGPT=${chatgptBotIdStr} | TypeChecker=${typeCheckerBotIdStr}`);
-
     client.addEventHandler(handleIncomingMessage, new NewMessage({}));
+    console.log("⚡ Telegram Client Listening...");
 
-    client.addEventHandler(async (update) => {
-      try {
-        if (
-          update.className === "UpdateEditMessage" ||
-          update.className === "UpdateEditChannelMessage"
-        ) {
-          await handleIncomingMessage({ message: update.message });
-        }
-      } catch (e) {
-        console.error("❌ Raw Edit Handler Error:", e.message);
-      }
-    });
-
-    console.log("🤖 Client Ready! Multi-Source Workflow Synchronized.");
-  } catch (e) {
-    console.error("❌ Init Error:", e.message);
+  } catch (err) {
+    console.error("❌ Client connection failed:", err.message);
   }
 }
 
