@@ -499,39 +499,136 @@ setInterval(cleanupVideoCache, 30 * 1000);
 // ============================================================
 // 🆕 BACKGROUND TRANSCODE — 360p (JUGAAD #1: quality kam karke bandwidth/CPU bachao)
 // ============================================================
-// Jab video channel pe aata hai, background mein turant 360p mein convert ho jata hai.
-// Stream endpoint pehle check karta hai — agar 360p ready hai, disk se turant serve.
-// Warna normal high-quality chunk-cache pipeline se serve hota hai.
-// 30 minute baad file auto-delete ho jaati hai (disk space bachane ke liye).
-const TRANSCODE_DIR = path.join(os.tmpdir(), "video-transcode-360p");
+// Jab video channel pe aata hai, background mein turant 360p mein convert ho jata hai,
+// aur turant archive.org pe upload ho jata hai — Render ka disk isse touch hi nahi hota
+// (upload hote hi local file delete). Stream endpoint seedha archive.org pe redirect kar deta hai.
+// Kuch der baad (30 min) archive.org se bhi file auto-delete ho jaati hai.
+const TRANSCODE_DIR = path.join(os.tmpdir(), "video-transcode-360p"); // sirf temp/staging ke liye
 if (!fs.existsSync(TRANSCODE_DIR)) {
   fs.mkdirSync(TRANSCODE_DIR, { recursive: true });
-  console.log(`📁 [TRANSCODE] 360p directory created: ${TRANSCODE_DIR}`);
+  console.log(`📁 [TRANSCODE] 360p staging directory created: ${TRANSCODE_DIR}`);
 }
 
 const transcodingInProgress = new Set(); // msgId jo abhi transcode ho rahe hain
-const transcodeDeleteTimers = new Map(); // msgId -> setTimeout handle (30min auto-delete)
+
+// 🆕 JUGAAD #3: TRANSCODE QUEUE — ek saath bahut saare videos aa jayen (batch upload) to
+// bhi Render CPU/RAM/disk overload na ho. Sirf MAX_CONCURRENT_TRANSCODES video ek time pe
+// process honge, baaki line mein wait karenge (thumbnail/tagging/streaming pe koi asar nahi,
+// sirf 360p transcode limited hai).
+const MAX_CONCURRENT_TRANSCODES = parseInt(process.env.MAX_CONCURRENT_TRANSCODES || "2");
+const transcodeQueue = []; // [{ msgId, message }]
+const queuedTranscodeIds = new Set(); // duplicate queue-entry se bachne ke liye
+let activeTranscodeCount = 0;
+
+function enqueueTranscode(msgId, message) {
+  if (transcodingInProgress.has(msgId) || queuedTranscodeIds.has(msgId) || isTranscodeReady(msgId)) return;
+  transcodeQueue.push({ msgId, message });
+  queuedTranscodeIds.add(msgId);
+  console.log(`📥 [TRANSCODE-QUEUE] msgId=${msgId} queue mein add hua | active=${activeTranscodeCount}/${MAX_CONCURRENT_TRANSCODES} | waiting=${transcodeQueue.length}`);
+  processTranscodeQueue();
+}
+
+function processTranscodeQueue() {
+  while (activeTranscodeCount < MAX_CONCURRENT_TRANSCODES && transcodeQueue.length > 0) {
+    const { msgId, message } = transcodeQueue.shift();
+    queuedTranscodeIds.delete(msgId);
+    activeTranscodeCount++;
+    startBackgroundTranscode(msgId, message).finally(() => {
+      activeTranscodeCount--;
+      processTranscodeQueue(); // agla queue wala uthao
+    });
+  }
+}
+const transcodeDeleteTimers = new Map(); // fallback: msgId -> setTimeout (agar archive upload fail ho)
+const archiveVideoMap = new Map(); // msgId -> { url, identifier, filename } (archive.org pe 360p)
+const archiveDeleteTimers = new Map(); // msgId -> setTimeout handle (archive.org se auto-delete)
+const ARCHIVE_VIDEO_TTL = 30 * 60 * 1000; // 30 minute baad archive.org se bhi delete
 
 function getTranscodedPath(msgId) {
   return path.join(TRANSCODE_DIR, `transcoded_${msgId}.mp4`);
 }
 
 function isTranscodeReady(msgId) {
-  return fs.existsSync(getTranscodedPath(msgId));
+  return archiveVideoMap.has(msgId) || fs.existsSync(getTranscodedPath(msgId));
 }
 
-// Har baar file access/create ho, 30min ka delete-timer reset (touch) ho jata hai
+// FALLBACK ONLY (agar archive upload fail ho jaaye) — Render disk se 30min baad delete
 function scheduleTranscodeDelete(msgId) {
   if (transcodeDeleteTimers.has(msgId)) {
     clearTimeout(transcodeDeleteTimers.get(msgId));
   }
   const timer = setTimeout(() => {
     fs.unlink(getTranscodedPath(msgId), (err) => {
-      if (!err) console.log(`🗑️ [TRANSCODE] 360p file auto-deleted (30min expiry) msgId=${msgId}`);
+      if (!err) console.log(`🗑️ [TRANSCODE] 360p fallback file auto-deleted (Render disk) msgId=${msgId}`);
     });
     transcodeDeleteTimers.delete(msgId);
   }, 30 * 60 * 1000);
   transcodeDeleteTimers.set(msgId, timer);
+}
+
+// Har baar access ho, TTL timer reset (touch) ho jata hai — jab tak koi dekh raha hai, expire nahi hoga
+function scheduleArchiveVideoDelete(msgId) {
+  if (archiveDeleteTimers.has(msgId)) {
+    clearTimeout(archiveDeleteTimers.get(msgId));
+  }
+  const timer = setTimeout(() => {
+    const entry = archiveVideoMap.get(msgId);
+    if (entry) deleteVideoFromArchive(entry.identifier, entry.filename);
+    archiveVideoMap.delete(msgId);
+    archiveDeleteTimers.delete(msgId);
+  }, ARCHIVE_VIDEO_TTL);
+  archiveDeleteTimers.set(msgId, timer);
+}
+
+async function uploadVideoToArchive(filePath, idPrefix) {
+  if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) {
+    console.error("❌ [ARCHIVE-VIDEO] ARCHIVE KEYS missing, upload skip!");
+    return null;
+  }
+
+  const identifier = `${idPrefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`.toLowerCase();
+  const filename = "video360p.mp4";
+  const uploadUrl = `https://s3.us.archive.org/${identifier}/${filename}`;
+  const stat = fs.statSync(filePath);
+
+  try {
+    await axios.put(uploadUrl, fs.createReadStream(filePath), {
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": stat.size,
+        "Authorization": `LOW ${ARCHIVE_ACCESS_KEY.trim()}:${ARCHIVE_SECRET_KEY.trim()}`,
+        "x-archive-auto-make-bucket": "1",
+        "x-archive-meta-mediatype": "movies",
+        "x-archive-meta-title": `360p ${identifier}`,
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      timeout: 10 * 60 * 1000, // bade video ke liye 10 min timeout
+    });
+
+    console.log(`✅ [ARCHIVE-VIDEO] Upload success: ${identifier} (${(stat.size / 1024 / 1024).toFixed(1)}MB)`);
+    return { url: `https://archive.org/download/${identifier}/${filename}`, identifier, filename };
+  } catch (e) {
+    const errDetails = e.response?.data ? String(e.response.data) : e.message;
+    console.error("❌ [ARCHIVE-VIDEO] Upload error:", errDetails);
+    return null;
+  }
+}
+
+async function deleteVideoFromArchive(identifier, filename) {
+  if (!ARCHIVE_ACCESS_KEY || !ARCHIVE_SECRET_KEY) return;
+  const url = `https://s3.us.archive.org/${identifier}/${filename}`;
+  try {
+    await axios.delete(url, {
+      headers: {
+        "Authorization": `LOW ${ARCHIVE_ACCESS_KEY.trim()}:${ARCHIVE_SECRET_KEY.trim()}`,
+      },
+    });
+    console.log(`🗑️ [ARCHIVE-VIDEO] archive.org se delete ho gaya: ${identifier}`);
+  } catch (e) {
+    const errDetails = e.response?.data ? String(e.response.data) : e.message;
+    console.error(`❌ [ARCHIVE-VIDEO] Delete error (${identifier}):`, errDetails);
+  }
 }
 
 async function startBackgroundTranscode(msgId, message) {
@@ -565,7 +662,7 @@ async function startBackgroundTranscode(msgId, message) {
       writeStream.on("finish", resolve);
     });
 
-    // 2. ffmpeg se 360p mein convert karo
+    // 2. ffmpeg se 360p mein convert karo (staging: Render ke temp disk pe, thodi der ke liye)
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegPath, [
         "-y",
@@ -591,8 +688,21 @@ async function startBackgroundTranscode(msgId, message) {
       ff.on("error", reject); // e.g. ffmpeg binary hi nahi mila
     });
 
-    console.log(`✅ [TRANSCODE] 360p ready msgId=${msgId} → ${outPath}`);
-    scheduleTranscodeDelete(msgId);
+    console.log(`✅ [TRANSCODE] 360p ready msgId=${msgId} → uploading to archive.org...`);
+
+    // 3. 🆕 Render disk pe rakhne ke bajaye turant archive.org pe upload karo
+    const archiveResult = await uploadVideoToArchive(outPath, `labdesk-360p-${msgId}`);
+
+    if (archiveResult) {
+      archiveVideoMap.set(msgId, archiveResult);
+      scheduleArchiveVideoDelete(msgId);
+      fs.unlink(outPath, () => {}); // 🆕 Render disk TURANT khali — 30min wait nahi karna
+      console.log(`☁️ [ARCHIVE-VIDEO] msgId=${msgId} ab archive.org se serve hoga, Render disk saaf hai.`);
+    } else {
+      // Upload fail ho gaya (keys missing / network issue) — fallback: Render disk pe hi rakho
+      console.log(`⚠️ [ARCHIVE-VIDEO] Upload fail — fallback: msgId=${msgId} Render disk se serve hoga (30min).`);
+      scheduleTranscodeDelete(msgId);
+    }
   } catch (e) {
     console.error(`❌ [TRANSCODE] Failed msgId=${msgId}:`, e.message);
     fs.unlink(outPath, () => {});
@@ -612,6 +722,32 @@ app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline + Chunk 
 // user ko "buffering" ka wait nahi karna padega. Ye AI-tagging pipeline ke parallel chalta hai,
 // isiliye by the time link kisi ko milta hai, cache already garam ho chuka hota hai.
 const PREWARM_BYTES = 1.5 * 1024 * 1024; // 1.5 MB
+
+// 🆕 Prewarm bhi queue se guzarta hai (halka hai, par 10 ek-saath aane par Telegram
+// flood-wait bhi de sakta hai — isliye max 4 parallel prewarm)
+const MAX_CONCURRENT_PREWARMS = parseInt(process.env.MAX_CONCURRENT_PREWARMS || "4");
+const prewarmQueue = [];
+const queuedPrewarmIds = new Set();
+let activePrewarmCount = 0;
+
+function enqueuePrewarm(msgId, entity, media) {
+  if (queuedPrewarmIds.has(msgId)) return;
+  prewarmQueue.push({ msgId, entity, media });
+  queuedPrewarmIds.add(msgId);
+  processPrewarmQueue();
+}
+
+function processPrewarmQueue() {
+  while (activePrewarmCount < MAX_CONCURRENT_PREWARMS && prewarmQueue.length > 0) {
+    const { msgId, entity, media } = prewarmQueue.shift();
+    queuedPrewarmIds.delete(msgId);
+    activePrewarmCount++;
+    prewarmStream(msgId, entity, media).finally(() => {
+      activePrewarmCount--;
+      processPrewarmQueue();
+    });
+  }
+}
 
 async function prewarmStream(msgId, entity, media) {
   const fileSize = Number(media.document ? media.document.size : 0);
@@ -652,8 +788,17 @@ app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
 
-    // 🆕 360p TRANSCODE CHECK — agar ready hai to Telegram se download kiye bina
-    // seedha disk se turant serve karo (fastest + Telegram rate-limit se bachaav)
+    // 🆕 360p ARCHIVE.ORG CHECK — agar upload ho chuka hai to Render ka bandwidth/disk
+    // istemal kiye bina seedha archive.org pe redirect kar do (fastest, Render pe load zero)
+    if (archiveVideoMap.has(msgId)) {
+      scheduleArchiveVideoDelete(msgId); // access hua to 30min TTL reset (touch)
+      const archiveUrl = archiveVideoMap.get(msgId).url;
+      console.log(`☁️ [ARCHIVE-VIDEO] msgId=${msgId} → redirect to ${archiveUrl}`);
+      return res.redirect(302, archiveUrl);
+    }
+
+    // 🆕 360p TRANSCODE FALLBACK — agar archive upload fail hua tha, Render disk se serve
+    // (fastest local fallback + Telegram rate-limit se bachaav)
     const transcodedPath = getTranscodedPath(msgId);
     if (fs.existsSync(transcodedPath)) {
       scheduleTranscodeDelete(msgId); // access hua to 30min timer reset (touch)
@@ -681,7 +826,7 @@ app.get("/stream/:msgId", async (req, res) => {
         });
         fs.createReadStream(transcodedPath).pipe(res);
       }
-      console.log(`⚡ [TRANSCODE] 360p SERVED from disk msgId=${msgId} (${fileSize} bytes)`);
+      console.log(`⚡ [TRANSCODE] 360p SERVED from Render disk (fallback) msgId=${msgId} (${fileSize} bytes)`);
       return;
     }
 
@@ -700,6 +845,16 @@ app.get("/stream/:msgId", async (req, res) => {
 
       const message = messages[0];
       const media = message.media;
+
+      // 🆕 JUGAAD (LAZY ACTIVATION): user ne is video pe click kiya hai — SIRF ab
+      // background 360p transcode + prewarm queue mein daalo. Function khud duplicate-safe
+      // hain (already-queued/in-progress/ready check karte hain), isliye baar-baar seek/reload
+      // pe bhi dobara kaam nahi hoga. Ye fire-and-forget hai, current request ko block nahi karta.
+      if (isVideoMessage(message)) {
+        enqueueTranscode(msgId, message);
+        enqueuePrewarm(msgId, entity, media);
+      }
+
       const fileSize = Number(media.document ? media.document.size : 0);
       const range = req.headers.range;
 
@@ -981,8 +1136,10 @@ async function handleIncomingMessage(event) {
         videoLocationCache.set(message.id, msgChatIdStr); // 🆕 stream lookup ke liye yaad rakho
         pushDirectToFirebase(message.id, streamLink);
         startThumbUpload(message.id, streamLink);
-        startBackgroundTranscode(message.id, message); // 🆕 background 360p transcode shuru
-        prewarmStream(message.id, currentSourceEntity, message.media); // 🆕 pehla chunk turant cache karo
+        // 🆕 Transcode/prewarm ab yahan SHURU NAHI hote — sirf jab user pehli baar
+        // /stream pe click karega tab hi trigger honge (dekho /stream/:msgId handler).
+        // Isse sirf "active" (dekhe ja rahe) video hi CPU/disk/bandwidth use karte hain,
+        // upload hote hi saare videos process nahi hote.
 
         const fallbackText = captionText || "Media File";
         enqueueForTagging(message.id, fallbackText);
