@@ -376,9 +376,6 @@ function isVideoMessage(message) {
   return false;
 }
 
-// ============================================================
-// 🆕 FIXED: startThumbUpload — Pending bhi patch karega agar Final abhi bana nahi
-// ============================================================
 function startThumbUpload(msgId, streamLink) {
   let resolvePromise;
   const promise = new Promise((r) => { resolvePromise = r; });
@@ -395,7 +392,6 @@ function startThumbUpload(msgId, streamLink) {
 
         const finalPath = finalizedDocPaths.get(msgId);
         if (finalPath && result) {
-          // Final entry already exists → patch Final
           try {
             const finalPatchUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(finalPath.subject)}/${encodeURIComponent(finalPath.chapter)}/${msgId}.json`;
             await axios.patch(finalPatchUrl, { thumb_link: result });
@@ -404,13 +400,11 @@ function startThumbUpload(msgId, streamLink) {
             console.error(`❌ [ARCHIVE] Final thumb patch error (msgId=${msgId}):`, e.message);
           }
         } else if (result) {
-          // 🆕 Final entry abhi nahi bani → Pending mein thumb_link patch karo
           const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
           try {
             await axios.patch(pendingUrl, { thumb_link: result });
             console.log(`✅ [ARCHIVE] Pending entry thumb patched for msgId=${msgId}`);
           } catch (e) {
-            // 404 = Pending already deleted/finalized, that's OK
             if (e.response?.status !== 404) {
               console.error(`❌ [ARCHIVE] Pending thumb patch error (msgId=${msgId}):`, e.message);
             }
@@ -427,9 +421,69 @@ function startThumbUpload(msgId, streamLink) {
   })();
 }
 
-app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline Integrated"));
+// ============================================================
+// 🆕 VIDEO CHUNK CACHE SYSTEM
+// ============================================================
+const VIDEO_CACHE_DIR = path.join(os.tmpdir(), 'video-chunk-cache');
+if (!fs.existsSync(VIDEO_CACHE_DIR)) {
+  fs.mkdirSync(VIDEO_CACHE_DIR, { recursive: true });
+  console.log(`📁 [CACHE] Video cache directory created: ${VIDEO_CACHE_DIR}`);
+}
 
-// 🆕 STREAM: Dono channels mein se dhoondhega
+const inflightChunks = new Set(); // "msgId_start_end" -> currently downloading
+
+function getChunkCachePath(msgId, start, end) {
+  return path.join(VIDEO_CACHE_DIR, `${msgId}_${start}_${end}.chunk`);
+}
+
+async function getCachedChunk(msgId, start, end) {
+  const filePath = getChunkCachePath(msgId, start, end);
+  try {
+    await fs.promises.access(filePath);
+    // Update mtime (touch) so cleanup doesn't delete recently used chunks
+    const now = new Date();
+    await fs.promises.utimes(filePath, now, now);
+    const data = await fs.promises.readFile(filePath);
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+async function saveChunkCache(msgId, start, end, buffer) {
+  const filePath = getChunkCachePath(msgId, start, end);
+  try {
+    await fs.promises.writeFile(filePath, buffer);
+  } catch (e) {
+    console.error(`❌ [CACHE] Save failed msgId=${msgId}:`, e.message);
+  }
+}
+
+function cleanupVideoCache() {
+  const TWO_MINUTES = 2 * 60 * 1000;
+  const now = Date.now();
+  fs.readdir(VIDEO_CACHE_DIR, (err, files) => {
+    if (err) return;
+    let deleted = 0;
+    files.forEach(file => {
+      const filePath = path.join(VIDEO_CACHE_DIR, file);
+      fs.stat(filePath, (err, stats) => {
+        if (!err && (now - stats.mtimeMs > TWO_MINUTES)) {
+          fs.unlink(filePath, () => {});
+          deleted++;
+        }
+      });
+    });
+    if (deleted > 0) console.log(`🗑️ [CACHE] ${deleted} old chunk(s) deleted (2min expiry)`);
+  });
+}
+setInterval(cleanupVideoCache, 30 * 1000);
+
+app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline + Chunk Cache"));
+
+// ============================================================
+// 🆕 STREAM: Chunk Cache ke saath
+// ============================================================
 app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -443,45 +497,121 @@ app.get("/stream/:msgId", async (req, res) => {
       const fileSize = Number(media.document ? media.document.size : 0);
       const range = req.headers.range;
 
+      let start = 0;
+      let end = fileSize - 1;
+      let chunkSize = fileSize;
+      let isRange = false;
+
       if (range && fileSize) {
         const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(startStr, 10);
-        const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
-        const chunkSize = end - start + 1;
+        start = parseInt(startStr, 10);
+        end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+        chunkSize = end - start + 1;
+        isRange = true;
+      }
 
-        res.writeHead(206, {
+      // 🆕 CACHE CHECK
+      const cacheKey = `${msgId}_${start}_${end}`;
+      const cached = await getCachedChunk(msgId, start, end);
+
+      if (cached) {
+        console.log(`⚡ [CACHE] HIT msgId=${msgId} [${start}-${end}] (${cached.length} bytes)`);
+        const headers = isRange ? {
           "Content-Range": `bytes ${start}-${end}/${fileSize}`,
           "Accept-Ranges": "bytes",
           "Content-Length": chunkSize,
           "Content-Type": "video/mp4",
-        });
+        } : {
+          "Content-Type": "video/mp4",
+          "Content-Length": fileSize,
+        };
+        res.writeHead(isRange ? 206 : 200, headers);
+        res.end(cached);
+        return;
+      }
 
+      // 🆕 If another request is already downloading this same chunk, wait for it
+      if (inflightChunks.has(cacheKey)) {
+        let waitLoops = 0;
+        while (inflightChunks.has(cacheKey) && waitLoops < 40) {
+          await sleep(250);
+          waitLoops++;
+        }
+        const retryCached = await getCachedChunk(msgId, start, end);
+        if (retryCached) {
+          console.log(`⚡ [CACHE] HIT after wait msgId=${msgId} [${start}-${end}]`);
+          const headers = isRange ? {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": chunkSize,
+            "Content-Type": "video/mp4",
+          } : {
+            "Content-Type": "video/mp4",
+            "Content-Length": fileSize,
+          };
+          res.writeHead(isRange ? 206 : 200, headers);
+          res.end(retryCached);
+          return;
+        }
+      }
+
+      // 🆕 DOWNLOAD FROM TELEGRAM + CACHE
+      console.log(`📥 [CACHE] MISS msgId=${msgId} [${start}-${end}] — downloading from Telegram...`);
+      inflightChunks.add(cacheKey);
+
+      const headers = isRange ? {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": "video/mp4",
+      } : {
+        "Content-Type": "video/mp4",
+        "Content-Length": fileSize,
+      };
+      res.writeHead(isRange ? 206 : 200, headers);
+
+      const chunks = [];
+      let clientClosed = false;
+      res.on('close', () => { clientClosed = true; });
+
+      try {
         const stream = client.iterDownload({ file: media, offset: bigInt(start), limit: chunkSize });
         for await (const chunk of stream) {
+          if (clientClosed) break;
+          chunks.push(chunk);
           if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
         }
-        res.end();
-      } else {
-        res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": fileSize });
-        const stream = client.iterDownload({ file: media, offset: bigInt(0) });
-        for await (const chunk of stream) {
-          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+
+        if (!clientClosed) {
+          res.end();
+          // Save to cache only if we got complete data
+          const fullBuffer = Buffer.concat(chunks);
+          if (fullBuffer.length === chunkSize) {
+            await saveChunkCache(msgId, start, end, fullBuffer);
+            console.log(`💾 [CACHE] SAVED msgId=${msgId} [${start}-${end}] (${fullBuffer.length} bytes)`);
+          } else {
+            console.log(`⚠️ [CACHE] Incomplete download msgId=${msgId} — not cached (${fullBuffer.length}/${chunkSize})`);
+          }
         }
-        res.end();
+      } catch (streamErr) {
+        console.error(`❌ [STREAM] Error msgId=${msgId}:`, streamErr.message);
+        if (!res.headersSent) res.status(500).send("Stream Error");
+      } finally {
+        inflightChunks.delete(cacheKey);
       }
-      return; // Message mil gaya, return
+      return;
     }
 
-    // Kisi channel mein nahi mila
     res.status(404).send("Not Found");
   } catch (e) {
+    console.error("❌ [STREAM] Route Error:", e.message);
     if (!res.headersSent) res.status(500).send("Streaming Error");
   } finally {
     clearMemory();
   }
 });
 
-// 🆕 DOWNLOAD: Dono channels mein se dhoondhega
+// 🆕 DOWNLOAD: Dono channels mein se dhoondhega (no cache needed for downloads)
 app.get("/download/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
@@ -518,7 +648,7 @@ app.get("/download/:msgId", async (req, res) => {
         if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
       }
       res.end();
-      return; // Message mil gaya, return
+      return;
     }
 
     res.status(404).send("Not Found");
@@ -529,9 +659,6 @@ app.get("/download/:msgId", async (req, res) => {
   }
 });
 
-// ============================================================
-// 🆕 FIXED: pushDirectToFirebase — simplified (thumbPromises check hata diya)
-// ============================================================
 async function pushDirectToFirebase(msgId, streamLink) {
   const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${msgId}.json`;
 
@@ -552,10 +679,8 @@ async function pushDirectToFirebase(msgId, streamLink) {
 }
 
 // -------------------------------------------------------------
-
-// ============================================================
-// 🆕 FIXED: cleanupOldPendingEntries — queues + correlation maps bhi saaf karega
-// ============================================================
+// 🧹 AUTO-CLEANUP: 4 minute timeout
+// -------------------------------------------------------------
 async function cleanupOldPendingEntries() {
   const now = Date.now();
   const FOUR_MINUTES = 4 * 60 * 1000;
@@ -578,13 +703,11 @@ async function cleanupOldPendingEntries() {
 
     pendingTimestamps.delete(msgId);
 
-    // Screenshot queues cleanup
     const idx = screenshotRequestQueue.indexOf(msgId);
     if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
     screenshotResults.delete(msgId);
     thumbPromises.delete(msgId);
 
-    // 🆕 AI reply queues se bhi hatao (taaki stale match na ho)
     for (let i = pendingReplyQueue.length - 1; i >= 0; i--) {
       if (pendingReplyQueue[i].msgId === msgId) {
         pendingReplyQueue.splice(i, 1);
@@ -596,7 +719,6 @@ async function cleanupOldPendingEntries() {
       }
     }
 
-    // 🆕 Correlation maps se hatao
     for (const [sentId, origId] of chatgptSentToOriginal.entries()) {
       if (origId === msgId) chatgptSentToOriginal.delete(sentId);
     }
@@ -685,7 +807,6 @@ async function handleIncomingMessage(event) {
       if (replyText.includes("@dpp")) detectedType = "@dpp";
       else if (replyText.includes("@notes")) detectedType = "@notes";
 
-      // 🆕 replyTo se correlate karo
       let matched = null;
       const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
       if (replyToId && typeCheckerSentToOriginal.has(replyToId)) {
@@ -750,7 +871,6 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      // 🆕 replyTo se correlate karo
       let matched = null;
       const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
       if (replyToId && chatgptSentToOriginal.has(replyToId)) {
@@ -865,7 +985,6 @@ async function startServer() {
   try {
     await client.connect();
 
-    // 🆕 BOT IDENTITY LOG
     let me = null;
     try {
       me = await client.getMe();
@@ -880,7 +999,6 @@ async function startServer() {
     typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
     typeCheckerBotIdStr = typeCheckerEntity.id.toString();
 
-    // 🆕 DONO SOURCE CHANNELS LOAD + ACCESS CHECK
     console.log(`📡 [CHANNEL-CHECK] ${SOURCE_CHATS.length} channels load kar raha hai...`);
     for (const chat of SOURCE_CHATS) {
       try {
@@ -890,7 +1008,6 @@ async function startServer() {
         sourceChatIdStrs.add(idStr);
         console.log(`📌 [CHANNEL-LOAD] ${chat} -> ID=${idStr} | Title="${entity.title || 'N/A'}"`);
 
-        // 🆕 ACCESS TEST: Last message fetch karke check karo
         try {
           const testMsgs = await client.getMessages(entity, { limit: 1 });
           if (testMsgs && testMsgs.length > 0 && testMsgs[0]) {
@@ -908,7 +1025,6 @@ async function startServer() {
       }
     }
 
-    // Final summary
     console.log(`📊 [CHANNEL-SUMMARY] Total Loaded: ${sourceEntities.size}/${SOURCE_CHATS.length}`);
     console.log(`📊 [CHANNEL-SUMMARY] Active IDs: [${Array.from(sourceChatIdStrs).join(", ")}]`);
 
@@ -934,7 +1050,7 @@ async function startServer() {
       }
     });
 
-    console.log("🤖 Client Ready! Multi-Source Workflow Synchronized.");
+    console.log("🤖 Client Ready! Multi-Source Workflow + Chunk Cache Active.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
