@@ -16,6 +16,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -69,6 +70,9 @@ const screenshotResults = new Map(); // msgId -> photoMessage
 const chatgptSentToOriginal = new Map(); // sentMsgId -> originalMsgId
 const typeCheckerSentToOriginal = new Map(); // forwardedMsgId -> originalMsgId
 
+// 🆕 BACKGROUND TRANSCODE STATE
+const transcodeJobs = new Map(); // msgId -> { status: 'pending'|'ready'|'failed', path: string, createdAt: number, size?: number }
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function clearMemory() {
@@ -93,7 +97,7 @@ function clearMemory() {
 }
 setInterval(clearMemory, 2 * 60 * 1000);
 
-const TEMP_PREFIXES = ["transcoded_", "transcodesrc_", "thumbsrc_", "thumbout_"];
+const TEMP_PREFIXES = ["thumbsrc_", "thumbout_"];
 function cleanupTempFiles() {
   fs.readdir(os.tmpdir(), (err, files) => {
     if (err) return;
@@ -111,6 +115,24 @@ function cleanupTempFiles() {
   });
 }
 setInterval(cleanupTempFiles, 15 * 1000);
+
+// 🆕 TRANSCODE CLEANUP — 35 min se purane orphan files hatao
+function cleanupTranscodeJobs() {
+  const THIRTY_FIVE_MINUTES = 35 * 60 * 1000;
+  const now = Date.now();
+  for (const [msgId, job] of transcodeJobs.entries()) {
+    if (now - job.createdAt > THIRTY_FIVE_MINUTES) {
+      if (job.path && fs.existsSync(job.path)) {
+        fs.unlink(job.path, () => {});
+      }
+      const inputPath = path.join(os.tmpdir(), `transcode360src_${msgId}.mp4`);
+      fs.unlink(inputPath, () => {});
+      transcodeJobs.delete(msgId);
+      console.log(`🗑️ [TRANSCODE-CLEANUP] Stale job removed msgId=${msgId}`);
+    }
+  }
+}
+setInterval(cleanupTranscodeJobs, 60 * 1000);
 
 const RULE_REMINDER_TEXT = `नियम याद दिला रहा हूँ:
 1. विषय टैग (जैसे: @Physics, @Chemistry, @Biology)
@@ -422,6 +444,106 @@ function startThumbUpload(msgId, streamLink) {
 }
 
 // ============================================================
+// 🆕 BACKGROUND TRANSCODE — 360p auto-convert
+// ============================================================
+async function transcodeVideo(msgId, entity) {
+  const inputPath = path.join(os.tmpdir(), `transcode360src_${msgId}.mp4`);
+  const outputPath = path.join(os.tmpdir(), `transcode360_${msgId}.mp4`);
+
+  // Duplicate job avoid karo
+  if (transcodeJobs.has(msgId)) {
+    console.log(`⏭️ [TRANSCODE] Job already exists for msgId=${msgId}, skipping duplicate.`);
+    return;
+  }
+
+  transcodeJobs.set(msgId, { status: 'pending', path: outputPath, createdAt: Date.now() });
+  console.log(`🎬 [TRANSCODE] Starting 360p transcode for msgId=${msgId}`);
+
+  try {
+    const messages = await client.getMessages(entity, { ids: msgId });
+    if (!messages || !messages[0] || !messages[0].media) {
+      throw new Error('Message not found or no media');
+    }
+
+    const message = messages[0];
+    const media = message.media;
+
+    // Stream download to temp file (backpressure handle ke saath)
+    const writeStream = fs.createWriteStream(inputPath);
+    const downloadIter = client.iterDownload({ file: media, offset: bigInt(0) });
+
+    for await (const chunk of downloadIter) {
+      if (!writeStream.write(chunk)) {
+        await new Promise(resolve => writeStream.once('drain', resolve));
+      }
+    }
+    writeStream.end();
+
+    await new Promise((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+    });
+
+    console.log(`📥 [TRANSCODE] Download complete for msgId=${msgId}, running ffmpeg...`);
+
+    // Run ffmpeg 360p
+    await new Promise((resolve, reject) => {
+      const ffmpeg = spawn('ffmpeg', [
+        '-i', inputPath,
+        '-vf', 'scale=-2:360',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        '-y',
+        outputPath
+      ]);
+
+      let ffmpegErr = '';
+      ffmpeg.stderr.on('data', (data) => {
+        ffmpegErr += data.toString();
+      });
+
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`ffmpeg exited ${code}: ${ffmpegErr.slice(-200)}`));
+        }
+      });
+
+      ffmpeg.on('error', (err) => reject(err));
+    });
+
+    // Verify output
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('Output file not created');
+    }
+
+    const stats = fs.statSync(outputPath);
+    transcodeJobs.set(msgId, { status: 'ready', path: outputPath, createdAt: Date.now(), size: stats.size });
+    console.log(`✅ [TRANSCODE] 360p ready for msgId=${msgId} (${stats.size} bytes)`);
+
+    // Input file turant delete
+    fs.unlink(inputPath, () => {});
+
+    // 🆕 30 minute baad auto-delete
+    setTimeout(() => {
+      fs.unlink(outputPath, () => {});
+      transcodeJobs.delete(msgId);
+      console.log(`🗑️ [TRANSCODE] Auto-deleted 360p for msgId=${msgId}`);
+    }, 30 * 60 * 1000);
+
+  } catch (e) {
+    console.error(`❌ [TRANSCODE] Failed msgId=${msgId}:`, e.message);
+    transcodeJobs.set(msgId, { status: 'failed', path: null, createdAt: Date.now() });
+    fs.unlink(inputPath, () => {});
+    fs.unlink(outputPath, () => {});
+  }
+}
+
+// ============================================================
 // 🆕 VIDEO CHUNK CACHE SYSTEM
 // ============================================================
 const VIDEO_CACHE_DIR = path.join(os.tmpdir(), 'video-chunk-cache');
@@ -479,15 +601,65 @@ function cleanupVideoCache() {
 }
 setInterval(cleanupVideoCache, 30 * 1000);
 
-app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline + Chunk Cache"));
+app.get("/", (req, res) => res.send("Bot Active - Multi-Source Pipeline + Chunk Cache + 360p Transcode"));
 
 // ============================================================
-// 🆕 STREAM: Chunk Cache ke saath
+// 🆕 STREAM: Pehle 360p check, phir chunk cache, phir Telegram
 // ============================================================
 app.get("/stream/:msgId", async (req, res) => {
   try {
     const msgId = parseInt(req.params.msgId);
 
+    // 🆕 STEP 1: TRANSCODED 360p CHECK — agar ready hai toh disk se turant serve karo
+    const transcodeJob = transcodeJobs.get(msgId);
+    if (transcodeJob && transcodeJob.status === 'ready' && fs.existsSync(transcodeJob.path)) {
+      const stat = fs.statSync(transcodeJob.path);
+      const fileSize = stat.size;
+      const range = req.headers.range;
+
+      let start = 0;
+      let end = fileSize - 1;
+      let chunkSize = fileSize;
+      let isRange = false;
+
+      if (range && fileSize) {
+        const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+        start = parseInt(startStr, 10);
+        end = endStr ? parseInt(endStr, 10) : fileSize - 1;
+        chunkSize = end - start + 1;
+        isRange = true;
+      }
+
+      const headers = isRange ? {
+        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunkSize,
+        "Content-Type": "video/mp4",
+      } : {
+        "Content-Type": "video/mp4",
+        "Content-Length": fileSize,
+      };
+
+      res.writeHead(isRange ? 206 : 200, headers);
+
+      const stream = fs.createReadStream(transcodeJob.path, isRange ? { start, end } : {});
+      stream.on('error', (err) => {
+        console.error(`❌ [TRANSCODE-STREAM] Read error msgId=${msgId}:`, err.message);
+        if (!res.headersSent) {
+          res.status(500).send("Transcoded stream error");
+        } else {
+          res.end();
+        }
+        stream.destroy();
+      });
+      stream.pipe(res);
+      res.on('close', () => stream.destroy());
+
+      console.log(`⚡ [TRANSCODE-STREAM] Serving 360p for msgId=${msgId} (${fileSize} bytes, range=${isRange})`);
+      return;
+    }
+
+    // STEP 2: Original quality streaming (chunk cache + Telegram)
     for (const [chatIdStr, entity] of sourceEntities) {
       const messages = await client.getMessages(entity, { ids: msgId });
       if (!messages || !messages[0] || !messages[0].media) continue;
@@ -778,6 +950,11 @@ async function handleIncomingMessage(event) {
         const fallbackText = captionText || "Media File";
         enqueueForTagging(message.id, fallbackText);
         console.log(`📨 [VIDEO] msgId=${message.id} → AI ko caption bheja: "${fallbackText.substring(0, 60)}..."`);
+
+        // 🆕 BACKGROUND TRANSCODE — 360p mein convert karo (don't await)
+        transcodeVideo(message.id, currentSourceEntity).catch(e => {
+          console.error(`❌ [TRANSCODE] Background error msgId=${message.id}:`, e.message);
+        });
       }
       else if (message.media && message.media.document) {
         console.log(`📄 Document detected (ID=${message.id}). Forwarding to @P840bot + AI...`);
@@ -982,6 +1159,15 @@ async function startServer() {
   clearMemory();
   cleanupTempFiles();
 
+  // 🆕 ffmpeg availability check
+  require('child_process').exec('ffmpeg -version', (error) => {
+    if (error) {
+      console.warn("⚠️ ffmpeg not found! Transcoding will fail. Install via: apt-get update && apt-get install -y ffmpeg");
+    } else {
+      console.log("✅ ffmpeg detected — 360p transcoding enabled.");
+    }
+  });
+
   try {
     await client.connect();
 
@@ -1050,7 +1236,7 @@ async function startServer() {
       }
     });
 
-    console.log("🤖 Client Ready! Multi-Source Workflow + Chunk Cache Active.");
+    console.log("🤖 Client Ready! Multi-Source Workflow + Chunk Cache + 360p Transcode Active.");
   } catch (e) {
     console.error("❌ Init Error:", e.message);
   }
