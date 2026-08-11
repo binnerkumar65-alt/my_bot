@@ -58,15 +58,31 @@ const sourceChatIdStrs = new Set();
 
 const messageCache = new Map();
 const thumbPromises = new Map();
-const activeThumbRequests = new Map();
 const finalizedDocPaths = new Map();
 const pendingTimestamps = new Map();
+
+// 🆕 THUMBNAIL FIFO QUEUE (pehle wala Map hata diya — ab queue se match hoga)
+const screenshotRequestQueue = []; // FIFO: msgIds waiting for screenshot
+const screenshotResults = new Map(); // msgId -> photoMessage
+
+// 🆕 CORRELATION MAPS (replyTo se exact match ke liye)
+const chatgptSentToOriginal = new Map(); // sentMsgId -> originalMsgId
+const typeCheckerSentToOriginal = new Map(); // forwardedMsgId -> originalMsgId
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function clearMemory() {
   try {
     messageCache.clear();
+    // Stale correlation entries clean karo
+    if (chatgptSentToOriginal.size > 200) {
+      const keys = Array.from(chatgptSentToOriginal.keys()).slice(0, chatgptSentToOriginal.size - 200);
+      keys.forEach(k => chatgptSentToOriginal.delete(k));
+    }
+    if (typeCheckerSentToOriginal.size > 200) {
+      const keys = Array.from(typeCheckerSentToOriginal.keys()).slice(0, typeCheckerSentToOriginal.size - 200);
+      keys.forEach(k => typeCheckerSentToOriginal.delete(k));
+    }
     if (global.gc) {
       global.gc();
       console.log("🧹 [RAM-CLEANUP] Memory saaf kar di gayi.");
@@ -161,12 +177,15 @@ async function processSendQueue() {
     const item = sendQueue.shift();
     try {
       if (!chatgptEntity) chatgptEntity = await client.getEntity(CHATGPT_BOT);
-      await client.sendMessage(chatgptEntity, { message: item.text });
       if (item.isReminder) {
+        await client.sendMessage(chatgptEntity, { message: item.text });
         console.log(`🔁 [RULE-REMINDER] Rules ChatGPT ko bhej diye.`);
       } else {
-        pendingReplyQueue.push({ msgId: item.msgId });
-        console.log(`📨 [TAG-QUEUE] ChatGPT ko bheja gaya msgId=${item.msgId} | pending replies: ${pendingReplyQueue.length}`);
+        const sent = await client.sendMessage(chatgptEntity, { message: item.text });
+        const sentMsgId = sent.id.toString();
+        chatgptSentToOriginal.set(sentMsgId, item.msgId);
+        pendingReplyQueue.push({ msgId: item.msgId, sentMsgId: sentMsgId });
+        console.log(`📨 [TAG-QUEUE] ChatGPT ko bheja gaya msgId=${item.msgId} (sentId=${sentMsgId}) | pending replies: ${pendingReplyQueue.length}`);
       }
     } catch (e) {
       console.error("❌ [TAG-QUEUE] Send error:", e.message);
@@ -181,13 +200,27 @@ async function forwardDocToTypeChecker(messageId, fromPeer) {
   try {
     if (!typeCheckerEntity) typeCheckerEntity = await client.getEntity(TYPE_CHECKER_BOT);
 
-    await client.forwardMessages(typeCheckerEntity, {
+    const result = await client.forwardMessages(typeCheckerEntity, {
       messages: [messageId],
       fromPeer: fromPeer,
     });
 
-    pendingTypeQueue.push({ msgId: messageId });
-    console.log(`⏩ [TYPE-CHECKER] Document msgId=${messageId} @P840bot ko forward kar diya.`);
+    let forwardedId = null;
+    if (result) {
+      const fwdMsgs = Array.isArray(result) ? result : (result.messages || []);
+      if (fwdMsgs.length > 0 && fwdMsgs[0].id) {
+        forwardedId = fwdMsgs[0].id.toString();
+      }
+    }
+
+    if (forwardedId) {
+      typeCheckerSentToOriginal.set(forwardedId, messageId);
+      pendingTypeQueue.push({ msgId: messageId, forwardedId: forwardedId });
+      console.log(`⏩ [TYPE-CHECKER] Document msgId=${messageId} @P840bot ko forward kar diya (fwdId=${forwardedId}).`);
+    } else {
+      pendingTypeQueue.push({ msgId: messageId });
+      console.log(`⏩ [TYPE-CHECKER] Document msgId=${messageId} @P840bot ko forward kar diya (no fwdId).`);
+    }
   } catch (e) {
     console.error("❌ [TYPE-CHECKER] Forwarding Error:", e.message);
   }
@@ -214,10 +247,8 @@ async function patchAiTagsToFirebase(msgId, replyText) {
 
   const contentType = staged.content_type || "@other";
 
-  let thumbUrl = null;
-  if (thumbPromises.has(msgId)) {
-    thumbUrl = await thumbPromises.get(msgId);
-  }
+  // 🆕 THUMB KA WAIT NAHI KARENGE — agar pehle se pending mein hai to use karo, warna blank
+  let thumbUrl = staged.thumb_link || "";
 
   const lecNum = lecTag.replace(/^@?Lec\s*/i, "").trim();
   const displayTitle = lecNum ? `${chapterName} — Lecture ${lecNum}` : chapterName;
@@ -228,7 +259,7 @@ async function patchAiTagsToFirebase(msgId, replyText) {
     download_link: (contentType === "@notes" || contentType === "@dpp")
       ? `${RENDER_URL}/download/${msgId}`
       : "",
-    thumb_link: thumbUrl || staged.thumb_link || "",
+    thumb_link: thumbUrl,
     timestamp: staged.timestamp || { ".sv": "timestamp" },
     subject: subjectName,
     chapter: chapterName,
@@ -258,21 +289,25 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
   if (!screenshotEntity) return null;
 
   try {
-    activeThumbRequests.set(msgId, null);
+    screenshotRequestQueue.push(msgId);
+    screenshotResults.delete(msgId); // clean stale
 
     await client.sendMessage(screenshotEntity, { message: streamLink });
     console.log(`📤 [THUMB-BOT] (msgId=${msgId}) @screenshort17_bot ko URL bhej diya: ${streamLink}`);
 
     let waitCount = 0;
-    while (activeThumbRequests.has(msgId) && activeThumbRequests.get(msgId) === null && waitCount < 90) {
+    while (!screenshotResults.has(msgId) && waitCount < 90) {
       await sleep(1000);
       waitCount++;
     }
 
-    const photoMsg = activeThumbRequests.get(msgId);
-    activeThumbRequests.delete(msgId);
+    const photoMsg = screenshotResults.get(msgId);
+    screenshotResults.delete(msgId);
+    // Remove from queue if still present (timeout case)
+    const idx = screenshotRequestQueue.indexOf(msgId);
+    if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
 
-    if (!photoMsg || photoMsg === null) {
+    if (!photoMsg) {
       console.error(`⚠️ [THUMB-BOT] (msgId=${msgId}) Screenshot bot se photo nahi mili (Timeout).`);
       return null;
     }
@@ -287,7 +322,9 @@ async function getThumbViaScreenshotBot(msgId, streamLink) {
     return null;
   } catch (e) {
     console.error(`❌ [THUMB-BOT] (msgId=${msgId}) Pipeline Error:`, e.message);
-    activeThumbRequests.delete(msgId);
+    const idx = screenshotRequestQueue.indexOf(msgId);
+    if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
+    screenshotResults.delete(msgId);
     return null;
   }
 }
@@ -352,6 +389,18 @@ function startThumbUpload(msgId, streamLink) {
       if (buffer) {
         result = await uploadToArchive(buffer, `labdesk-thumb-${msgId}`);
         console.log(`🔗 [ARCHIVE] Direct Link for msgId=${msgId}: ${result}`);
+
+        // 🆕 Agar final entry already ban chuki hai, to thumb usme bhi patch karo
+        const finalPath = finalizedDocPaths.get(msgId);
+        if (finalPath && result) {
+          try {
+            const finalPatchUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(finalPath.subject)}/${encodeURIComponent(finalPath.chapter)}/${msgId}.json`;
+            await axios.patch(finalPatchUrl, { thumb_link: result });
+            console.log(`✅ [ARCHIVE] Final entry thumb patched for msgId=${msgId}`);
+          } catch (e) {
+            console.error(`❌ [ARCHIVE] Final thumb patch error (msgId=${msgId}):`, e.message);
+          }
+        }
       }
     } catch (e) {
       console.error(`❌ Thumb Upload Error (msgId=${msgId}):`, e.message);
@@ -521,7 +570,9 @@ async function cleanupOldPendingEntries() {
     }
 
     pendingTimestamps.delete(msgId);
-    activeThumbRequests.delete(msgId);
+    const idx = screenshotRequestQueue.indexOf(msgId);
+    if (idx !== -1) screenshotRequestQueue.splice(idx, 1);
+    screenshotResults.delete(msgId);
     thumbPromises.delete(msgId);
   }
 }
@@ -605,15 +656,33 @@ async function handleIncomingMessage(event) {
       if (replyText.includes("@dpp")) detectedType = "@dpp";
       else if (replyText.includes("@notes")) detectedType = "@notes";
 
-      const matched = pendingTypeQueue.shift();
+      // 🆕 replyTo se correlate karo
+      let matched = null;
+      const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
+      if (replyToId && typeCheckerSentToOriginal.has(replyToId)) {
+        const originalMsgId = typeCheckerSentToOriginal.get(replyToId);
+        const idx = pendingTypeQueue.findIndex(p => p.msgId === originalMsgId);
+        if (idx !== -1) {
+          matched = pendingTypeQueue.splice(idx, 1)[0];
+          typeCheckerSentToOriginal.delete(replyToId);
+          console.log(`🔗 [TYPE-CHECKER] Correlated via replyTo: replyToId=${replyToId} -> originalMsgId=${originalMsgId}`);
+        }
+      }
+      if (!matched) {
+        matched = pendingTypeQueue.shift();
+        if (matched) {
+          console.log(`⚠️ [TYPE-CHECKER] replyTo missing, using FIFO fallback for msgId=${matched.msgId}`);
+        }
+      }
+
       if (matched) {
         console.log(`📝 [TYPE-CHECKER] msgId=${matched.msgId} ka type "${detectedType}" mil gaya.`);
         const pendingUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/Pending/${matched.msgId}.json`;
 
         try {
-          await axios.patch(pendingUrl, { 
+          await axios.patch(pendingUrl, {
             content_type: detectedType,
-            download_link: `${RENDER_URL}/download/${matched.msgId}` 
+            download_link: `${RENDER_URL}/download/${matched.msgId}`
           });
         } catch (e) {
           if (e.response && e.response.status === 404) {
@@ -621,9 +690,9 @@ async function handleIncomingMessage(event) {
             if (finalPath) {
               const finalPatchUrl = `${FIREBASE_BASE_URL.replace(/\/$/, "")}/${encodeURIComponent(finalPath.subject)}/${encodeURIComponent(finalPath.chapter)}/${matched.msgId}.json`;
               try {
-                await axios.patch(finalPatchUrl, { 
+                await axios.patch(finalPatchUrl, {
                   content_type: detectedType,
-                  download_link: `${RENDER_URL}/download/${matched.msgId}` 
+                  download_link: `${RENDER_URL}/download/${matched.msgId}`
                 });
                 console.log(`📝 [TYPE-CHECKER] Final entry patched for msgId=${matched.msgId}`);
               } catch (e2) {
@@ -652,7 +721,25 @@ async function handleIncomingMessage(event) {
         return;
       }
 
-      const matched = pendingReplyQueue.shift();
+      // 🆕 replyTo se correlate karo
+      let matched = null;
+      const replyToId = (message.replyTo?.replyToMsgId || message.replyToMsgId)?.toString();
+      if (replyToId && chatgptSentToOriginal.has(replyToId)) {
+        const originalMsgId = chatgptSentToOriginal.get(replyToId);
+        const idx = pendingReplyQueue.findIndex(p => p.msgId === originalMsgId);
+        if (idx !== -1) {
+          matched = pendingReplyQueue.splice(idx, 1)[0];
+          chatgptSentToOriginal.delete(replyToId);
+          console.log(`🔗 [CHATGPT] Correlated via replyTo: replyToId=${replyToId} -> originalMsgId=${originalMsgId}`);
+        }
+      }
+      if (!matched) {
+        matched = pendingReplyQueue.shift();
+        if (matched) {
+          console.log(`⚠️ [CHATGPT] replyTo missing, using FIFO fallback for msgId=${matched.msgId}`);
+        }
+      }
+
       if (!matched) {
         console.log(`⚠️ [CHATGPT] Reply aaya par pendingReplyQueue khaali thi.`);
         return;
@@ -717,17 +804,17 @@ async function handleIncomingMessage(event) {
     }
 
     // 4. Screenshot Bot Reply
-    const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) || 
+    const isFromScreenshotBot = (screenshotBotIdStr && senderIdSync === screenshotBotIdStr) ||
                                 (screenshotBotIdStr && msgChatIdStr.includes(screenshotBotIdStr));
 
     if (isFromScreenshotBot) {
       if (message.photo || (message.media && message.media.className === 'MessageMediaPhoto')) {
-        for (const [msgId, val] of activeThumbRequests.entries()) {
-          if (val === null) {
-            activeThumbRequests.set(msgId, message);
-            console.log(`📸 [THUMB-BOT] Screenshot successfully matched for msgId=${msgId}`);
-            break;
-          }
+        const targetMsgId = screenshotRequestQueue.shift();
+        if (targetMsgId) {
+          screenshotResults.set(targetMsgId, message);
+          console.log(`📸 [THUMB-BOT] Screenshot successfully matched for msgId=${targetMsgId}`);
+        } else {
+          console.log(`⚠️ [THUMB-BOT] Unexpected photo received, no pending request.`);
         }
       }
       return;
