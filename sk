@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Quiz Lock</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+    background: linear-gradient(135deg, #1f2937, #111827);
+    overflow: hidden;
+  }
+  #overlay {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    padding: 24px;
+    color: #fff;
+  }
+  #card {
+    background: #1f2937;
+    border-radius: 16px;
+    padding: 28px 22px;
+    max-width: 480px;
+    width: 100%;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+    text-align: center;
+  }
+  #question {
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 24px;
+    line-height: 1.5;
+  }
+  .option-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    border-radius: 10px;
+    border: 2px solid #374151;
+    background: #111827;
+    color: #fff;
+    font-size: 16px;
+    cursor: pointer;
+    transition: 0.2s;
+  }
+  .option-btn:hover { border-color: #60a5fa; }
+  .option-btn.correct { background: #16a34a; border-color: #16a34a; }
+  .option-btn.wrong { background: #dc2626; border-color: #dc2626; }
+  #status {
+    margin-top: 16px;
+    font-size: 16px;
+    min-height: 24px;
+  }
+  #retry-btn {
+    margin-top: 16px;
+    padding: 12px 28px;
+    border: none;
+    border-radius: 10px;
+    background: #2563eb;
+    color: #fff;
+    font-size: 16px;
+    cursor: pointer;
+    display: none;
+  }
+  #loading { font-size: 16px; color: #9ca3af; }
+  #wait-box { display: none; }
+  #wait-text { font-size: 18px; margin-bottom: 16px; }
+  #countdown {
+    font-size: 42px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #60a5fa;
+  }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <div id="card">
+    <div id="loading">Question load ho raha hai...</div>
+    <div id="question" style="display:none;"></div>
+    <div id="options"></div>
+    <div id="status"></div>
+    <button id="retry-btn">Try Again 🔁</button>
+
+    <div id="wait-box">
+      <div id="wait-text">❌ Saare questions khatam ho gaye.<br>Naye questions ban rahe hain, thoda wait karo...</div>
+      <div id="countdown">4:00</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== CONFIG ====================
+// Apna Firebase Realtime Database ka link yahan daalo (bina .json ke)
+const FIREBASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
+// Render wala backend URL (jaha main.py chal raha hai) -- /regenerate isi pe call hoga
+const SERVER_URL = "https://quiz-5kyk.onrender.com";
+// ==================================================
+
+let questions = [];      // Firebase se aaya batch (order se)
+let currentIndex = 0;
+let solved = false;
+let waitTimer = null;
+
+async function loadQuestions() {
+  showLoadingState();
+
+  try {
+    const res = await fetch(`${FIREBASE_URL}/.json`);
+    const data = await res.json();
+
+    if (!data) {
+      // Abhi koi question nahi -- seedha wait mode me chale jao
+      startWaitMode();
+      return;
+    }
+
+    // Keys ko order se sort karo taaki sequence sahi rahe (Firebase push keys
+    // time ke hisaab se lexicographically ordered hoti hain)
+    questions = Object.keys(data).sort().map(k => ({ key: k, ...data[k] }));
+    currentIndex = 0;
+    showQuestion();
+  } catch (err) {
+    console.error(err);
+    document.getElementById("loading").textContent = "Firebase se data lene me error aaya.";
+  }
+}
+
+function showLoadingState() {
+  document.getElementById("wait-box").style.display = "none";
+  document.getElementById("loading").style.display = "block";
+  document.getElementById("loading").textContent = "Question load ho raha hai...";
+  document.getElementById("question").style.display = "none";
+  document.getElementById("options").innerHTML = "";
+  document.getElementById("status").textContent = "";
+  document.getElementById("retry-btn").style.display = "none";
+}
+
+function showQuestion() {
+  if (currentIndex >= questions.length) {
+    startWaitMode();
+    return;
+  }
+  renderQuestion(questions[currentIndex]);
+}
+
+let currentAnswer = null;
+
+function renderQuestion(q) {
+  solved = false;
+  currentAnswer = q.answer;
+
+  document.getElementById("wait-box").style.display = "none";
+  document.getElementById("loading").style.display = "none";
+  const questionEl = document.getElementById("question");
+  questionEl.style.display = "block";
+  questionEl.textContent = q.question;
+
+  const optionsEl = document.getElementById("options");
+  optionsEl.innerHTML = "";
+  document.getElementById("status").textContent = "";
+  document.getElementById("retry-btn").style.display = "none";
+
+  q.options.forEach((opt) => {
+    const btn = document.createElement("button");
+    btn.className = "option-btn";
+    btn.textContent = opt;
+    btn.onclick = () => checkAnswer(opt, btn);
+    optionsEl.appendChild(btn);
+  });
+}
+
+function checkAnswer(selectedOption, btnEl) {
+  if (solved) return;
+
+  const selectedLetter = selectedOption.trim().charAt(0);
+  const correctLetter = String(currentAnswer).trim().charAt(0);
+
+  if (selectedLetter === correctLetter) {
+    solved = true;
+    btnEl.classList.add("correct");
+    document.getElementById("status").textContent = "✅ Sahi jawab!";
+    disableAllOptions();
+
+    setTimeout(() => {
+      document.getElementById("overlay").style.display = "none";
+      // window.close();  // agar tab band karni ho to uncomment karo
+    }, 1000);
+  } else {
+    btnEl.classList.add("wrong");
+    document.getElementById("status").textContent = "❌ Galat jawab.";
+    disableAllOptions();
+    document.getElementById("retry-btn").style.display = "inline-block";
+  }
+}
+
+function disableAllOptions() {
+  document.querySelectorAll(".option-btn").forEach(b => b.onclick = null);
+}
+
+document.getElementById("retry-btn").onclick = () => {
+  currentIndex++;               // agla question (sequence me)
+  showQuestion();
+};
+
+function startWaitMode() {
+  document.getElementById("loading").style.display = "none";
+  document.getElementById("question").style.display = "none";
+  document.getElementById("options").innerHTML = "";
+  document.getElementById("status").textContent = "";
+  document.getElementById("retry-btn").style.display = "none";
+  document.getElementById("wait-box").style.display = "block";
+
+  // Server ko regenerate ka command bhejo (purane delete + naye 4 questions mangwao)
+  fetch(`${SERVER_URL}/regenerate`, { method: "POST" }).catch(err => console.error(err));
+
+  let seconds = 240; // 4 minute
+  updateCountdown(seconds);
+
+  clearInterval(waitTimer);
+  waitTimer = setInterval(() => {
+    seconds--;
+    updateCountdown(seconds);
+    if (seconds <= 0) {
+      clearInterval(waitTimer);
+      loadQuestions();  // 4 minute baad naye questions ke sath dobara try
+    }
+  }, 1000);
+}
+
+function updateCountdown(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  document.getElementById("countdown").textContent = `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+// Page load hote hi questions laao
+loadQuestions();
+</script>
+
+</body>
+</html>
