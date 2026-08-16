@@ -101,7 +101,17 @@
 const FIREBASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
 // Render wala backend URL (jaha main.py chal raha hai) -- /regenerate isi pe call hoga
 const SERVER_URL = "https://quiz-5kyk.onrender.com";
+// Fully Kiosk Browser ke Settings -> Remote Administration me jo Remote Admin Password set kiya hai, wahi yahan daalo
+const FULLY_KIOSK_PASSWORD = "9608";
 // ==================================================
+
+// Sahi answer par Fully Kiosk ke kiosk/lock mode ko band karne ke liye local API call
+function unlockFullyKiosk() {
+  // Fully Kiosk hamesha isi device ke localhost:2323 par apna local API chalata hai
+  fetch(`http://localhost:2323/?cmd=stopKioskMode&password=${encodeURIComponent(FULLY_KIOSK_PASSWORD)}&type=json`)
+    .then(() => console.log("Fully Kiosk: lock hata diya gaya"))
+    .catch(err => console.error("Fully Kiosk unlock call fail hui:", err));
+}
 
 let questions = [];      // Firebase se aaya batch (order se)
 let currentIndex = 0;
@@ -190,6 +200,7 @@ function checkAnswer(selectedOption, btnEl) {
 
     setTimeout(() => {
       document.getElementById("overlay").style.display = "none";
+      unlockFullyKiosk();   // sahi answer par phone ka kiosk lock hata do
       // window.close();  // agar tab band karni ho to uncomment karo
     }, 1000);
   } else {
