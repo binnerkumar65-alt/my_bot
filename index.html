@@ -3,17 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Quiz Lock</title>
+<title>Quiz</title>
 <style>
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; height: 100%;
+    margin: 0; padding: 0; min-height: 100%;
     font-family: 'Segoe UI', Roboto, Arial, sans-serif;
     background: linear-gradient(135deg, #1f2937, #111827);
-    overflow: hidden;
   }
   #overlay {
-    position: fixed; inset: 0;
+    min-height: 100vh;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
     padding: 24px;
@@ -28,11 +27,17 @@
     box-shadow: 0 10px 40px rgba(0,0,0,0.5);
     text-align: center;
   }
+  #progress {
+    font-size: 14px;
+    color: #9ca3af;
+    margin-bottom: 10px;
+  }
   #question {
     font-size: 20px;
     font-weight: 600;
     margin-bottom: 24px;
     line-height: 1.5;
+    text-align: left;
   }
   .option-btn {
     display: block;
@@ -49,48 +54,62 @@
     transition: 0.2s;
   }
   .option-btn:hover { border-color: #60a5fa; }
+  .option-btn.selected { background: #2563eb; border-color: #2563eb; }
   .option-btn.correct { background: #16a34a; border-color: #16a34a; }
   .option-btn.wrong { background: #dc2626; border-color: #dc2626; }
-  #status {
-    margin-top: 16px;
-    font-size: 16px;
-    min-height: 24px;
-  }
-  #retry-btn {
-    margin-top: 16px;
-    padding: 12px 28px;
+  .option-btn:disabled { cursor: default; }
+
+  #next-btn, #restart-btn, #review-btn {
+    margin-top: 8px;
+    padding: 14px 28px;
     border: none;
     border-radius: 10px;
     background: #2563eb;
     color: #fff;
     font-size: 16px;
+    font-weight: 600;
     cursor: pointer;
+    width: 100%;
     display: none;
   }
+  #next-btn:disabled { background: #374151; cursor: not-allowed; }
+
   #loading { font-size: 16px; color: #9ca3af; }
-  #wait-box { display: none; }
-  #wait-text { font-size: 18px; margin-bottom: 16px; }
-  #countdown {
-    font-size: 42px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    color: #60a5fa;
+
+  #score-box { display: none; }
+  #score-text { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
+  #score-sub { font-size: 15px; color: #9ca3af; margin-bottom: 20px; }
+
+  #review-box { display: none; text-align: left; margin-top: 16px; }
+  .review-item {
+    background: #111827;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 12px;
+    border-left: 4px solid #dc2626;
   }
+  .review-q { font-weight: 600; margin-bottom: 8px; }
+  .review-your { color: #f87171; font-size: 14px; margin-bottom: 4px; }
+  .review-correct { color: #4ade80; font-size: 14px; }
 </style>
 </head>
 <body>
 
 <div id="overlay">
   <div id="card">
-    <div id="loading">Question load ho raha hai...</div>
+    <div id="loading">Questions load ho rahe hain...</div>
+
+    <div id="progress" style="display:none;"></div>
     <div id="question" style="display:none;"></div>
     <div id="options"></div>
-    <div id="status"></div>
-    <button id="retry-btn">Try Again 🔁</button>
+    <button id="next-btn">Next</button>
 
-    <div id="wait-box">
-      <div id="wait-text">❌ Saare questions khatam ho gaye.<br>Naye questions ban rahe hain, thoda wait karo...</div>
-      <div id="countdown">4:00</div>
+    <div id="score-box">
+      <div id="score-text"></div>
+      <div id="score-sub"></div>
+      <button id="review-btn">Galat Wale Dekho ❌</button>
+      <button id="restart-btn">Dobara Quiz Do 🔁</button>
+      <div id="review-box"></div>
     </div>
   </div>
 </div>
@@ -99,42 +118,33 @@
 // ==================== CONFIG ====================
 // Apna Firebase Realtime Database ka link yahan daalo (bina .json ke)
 const FIREBASE_URL = "https://newfire-2258c-default-rtdb.firebaseio.com";
-// Render wala backend URL (jaha main.py chal raha hai) -- /regenerate isi pe call hoga
-const SERVER_URL = "https://quiz-5kyk.onrender.com";
-// Fully Kiosk Browser ke Settings -> Remote Administration me jo Remote Admin Password set kiya hai, wahi yahan daalo
-const FULLY_KIOSK_PASSWORD = "9608";
 // ==================================================
 
-// Sahi answer par Fully Kiosk ke kiosk/lock mode ko band karne ke liye local API call
-function unlockFullyKiosk() {
-  // Fully Kiosk hamesha isi device ke localhost:2323 par apna local API chalata hai
-  fetch(`http://localhost:2323/?cmd=stopKioskMode&password=${encodeURIComponent(FULLY_KIOSK_PASSWORD)}&type=json`)
-    .then(() => console.log("Fully Kiosk: lock hata diya gaya"))
-    .catch(err => console.error("Fully Kiosk unlock call fail hui:", err));
-}
-
-let questions = [];      // Firebase se aaya batch (order se)
+let questions = [];      // Firebase se aaya batch
 let currentIndex = 0;
-let solved = false;
-let waitTimer = null;
+let selectedAnswers = {}; // { questionIndex: selectedLetter }
 
 async function loadQuestions() {
   showLoadingState();
+  selectedAnswers = {};
+  currentIndex = 0;
 
   try {
-    const res = await fetch(`${FIREBASE_URL}/.json`);
+    const res = await fetch(`${FIREBASE_URL}/questions.json`);
     const data = await res.json();
 
     if (!data) {
-      // Abhi koi question nahi -- seedha wait mode me chale jao
-      startWaitMode();
+      document.getElementById("loading").textContent = "Abhi koi question available nahi hai.";
       return;
     }
 
-    // Keys ko order se sort karo taaki sequence sahi rahe (Firebase push keys
-    // time ke hisaab se lexicographically ordered hoti hain)
-    questions = Object.keys(data).sort().map(k => ({ key: k, ...data[k] }));
-    currentIndex = 0;
+    questions = Object.keys(data).map(k => ({ key: k, ...data[k] }));
+
+    if (questions.length === 0) {
+      document.getElementById("loading").textContent = "Abhi koi question available nahi hai.";
+      return;
+    }
+
     showQuestion();
   } catch (err) {
     console.error(err);
@@ -143,112 +153,159 @@ async function loadQuestions() {
 }
 
 function showLoadingState() {
-  document.getElementById("wait-box").style.display = "none";
   document.getElementById("loading").style.display = "block";
-  document.getElementById("loading").textContent = "Question load ho raha hai...";
+  document.getElementById("loading").textContent = "Questions load ho rahe hain...";
+  document.getElementById("progress").style.display = "none";
   document.getElementById("question").style.display = "none";
   document.getElementById("options").innerHTML = "";
-  document.getElementById("status").textContent = "";
-  document.getElementById("retry-btn").style.display = "none";
+  document.getElementById("next-btn").style.display = "none";
+  document.getElementById("score-box").style.display = "none";
+  document.getElementById("review-box").style.display = "none";
+  document.getElementById("review-box").innerHTML = "";
 }
 
 function showQuestion() {
-  if (currentIndex >= questions.length) {
-    startWaitMode();
-    return;
-  }
-  renderQuestion(questions[currentIndex]);
-}
-
-let currentAnswer = null;
-
-function renderQuestion(q) {
-  solved = false;
-  currentAnswer = q.answer;
-
-  document.getElementById("wait-box").style.display = "none";
   document.getElementById("loading").style.display = "none";
+  document.getElementById("score-box").style.display = "none";
+
+  const q = questions[currentIndex];
+
+  const progressEl = document.getElementById("progress");
+  progressEl.style.display = "block";
+  progressEl.textContent = `Question ${currentIndex + 1} / ${questions.length}`;
+
   const questionEl = document.getElementById("question");
   questionEl.style.display = "block";
   questionEl.textContent = q.question;
 
   const optionsEl = document.getElementById("options");
   optionsEl.innerHTML = "";
-  document.getElementById("status").textContent = "";
-  document.getElementById("retry-btn").style.display = "none";
 
   q.options.forEach((opt) => {
     const btn = document.createElement("button");
     btn.className = "option-btn";
     btn.textContent = opt;
-    btn.onclick = () => checkAnswer(opt, btn);
+    const letter = opt.trim().charAt(0);
+    if (selectedAnswers[currentIndex] === letter) {
+      btn.classList.add("selected");
+    }
+    btn.onclick = () => selectOption(letter, btn);
     optionsEl.appendChild(btn);
   });
+
+  const nextBtn = document.getElementById("next-btn");
+  nextBtn.style.display = "block";
+  nextBtn.textContent = (currentIndex === questions.length - 1) ? "Submit Quiz" : "Next";
+  nextBtn.disabled = !(currentIndex in selectedAnswers);
 }
 
-function checkAnswer(selectedOption, btnEl) {
-  if (solved) return;
+function selectOption(letter, btnEl) {
+  selectedAnswers[currentIndex] = letter;
+  document.querySelectorAll(".option-btn").forEach(b => b.classList.remove("selected"));
+  btnEl.classList.add("selected");
+  document.getElementById("next-btn").disabled = false;
+}
 
-  const selectedLetter = selectedOption.trim().charAt(0);
-  const correctLetter = String(currentAnswer).trim().charAt(0);
+document.getElementById("next-btn").onclick = () => {
+  if (!(currentIndex in selectedAnswers)) return;
 
-  if (selectedLetter === correctLetter) {
-    solved = true;
-    btnEl.classList.add("correct");
-    document.getElementById("status").textContent = "✅ Sahi jawab!";
-    disableAllOptions();
-
-    setTimeout(() => {
-      document.getElementById("overlay").style.display = "none";
-      unlockFullyKiosk();   // sahi answer par phone ka kiosk lock hata do
-      // window.close();  // agar tab band karni ho to uncomment karo
-    }, 1000);
+  if (currentIndex === questions.length - 1) {
+    finishQuiz();
   } else {
-    btnEl.classList.add("wrong");
-    document.getElementById("status").textContent = "❌ Galat jawab.";
-    disableAllOptions();
-    document.getElementById("retry-btn").style.display = "inline-block";
+    currentIndex++;
+    showQuestion();
   }
-}
-
-function disableAllOptions() {
-  document.querySelectorAll(".option-btn").forEach(b => b.onclick = null);
-}
-
-document.getElementById("retry-btn").onclick = () => {
-  currentIndex++;               // agla question (sequence me)
-  showQuestion();
 };
 
-function startWaitMode() {
-  document.getElementById("loading").style.display = "none";
+function finishQuiz() {
+  document.getElementById("progress").style.display = "none";
   document.getElementById("question").style.display = "none";
   document.getElementById("options").innerHTML = "";
-  document.getElementById("status").textContent = "";
-  document.getElementById("retry-btn").style.display = "none";
-  document.getElementById("wait-box").style.display = "block";
+  document.getElementById("next-btn").style.display = "none";
 
-  // Server ko regenerate ka command bhejo (purane delete + naye 4 questions mangwao)
-  fetch(`${SERVER_URL}/regenerate`, { method: "POST" }).catch(err => console.error(err));
+  let correctCount = 0;
+  const wrongList = [];
+  const wrongCountByPhoto = {};
 
-  let seconds = 240; // 4 minute
-  updateCountdown(seconds);
-
-  clearInterval(waitTimer);
-  waitTimer = setInterval(() => {
-    seconds--;
-    updateCountdown(seconds);
-    if (seconds <= 0) {
-      clearInterval(waitTimer);
-      loadQuestions();  // 4 minute baad naye questions ke sath dobara try
+  questions.forEach((q, idx) => {
+    const userLetter = selectedAnswers[idx];
+    const correctLetter = String(q.answer).trim().charAt(0);
+    if (userLetter === correctLetter) {
+      correctCount++;
+    } else {
+      wrongList.push({ q, userLetter, correctLetter });
+      if (q.photo_id) {
+        wrongCountByPhoto[q.photo_id] = (wrongCountByPhoto[q.photo_id] || 0) + 1;
+      }
     }
-  }, 1000);
+  });
+
+  document.getElementById("score-text").textContent = `Aapka Score: ${correctCount} / ${questions.length}`;
+  document.getElementById("score-sub").textContent =
+    wrongList.length === 0 ? "Sabhi sahi! 🎉" : `${wrongList.length} sawal galat hue.`;
+
+  const reviewBtn = document.getElementById("review-btn");
+  reviewBtn.style.display = wrongList.length > 0 ? "block" : "none";
+
+  const reviewBox = document.getElementById("review-box");
+  reviewBox.innerHTML = "";
+  reviewBox.style.display = "none";
+
+  wrongList.forEach(({ q, userLetter, correctLetter }) => {
+    const item = document.createElement("div");
+    item.className = "review-item";
+    item.innerHTML = `
+      <div class="review-q">${escapeHtml(q.question)}</div>
+      <div class="review-your">Aapka jawab: ${userLetter || "(chuna nahi)"}</div>
+      <div class="review-correct">Sahi jawab: ${correctLetter}</div>
+    `;
+    reviewBox.appendChild(item);
+  });
+
+  document.getElementById("score-box").style.display = "block";
+
+  reportWrongCounts(wrongCountByPhoto);
 }
 
-function updateCountdown(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  document.getElementById("countdown").textContent = `${m}:${s.toString().padStart(2, "0")}`;
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+document.getElementById("review-btn").onclick = () => {
+  const box = document.getElementById("review-box");
+  const btn = document.getElementById("review-btn");
+  if (box.style.display === "none") {
+    box.style.display = "block";
+    btn.textContent = "Galat Wale Chupao";
+  } else {
+    box.style.display = "none";
+    btn.textContent = "Galat Wale Dekho ❌";
+  }
+};
+
+document.getElementById("restart-btn").onclick = () => {
+  loadQuestions();
+};
+
+// Har photo_id ka wrong_count Firebase me update karo, taaki bot ko pata chale
+// kaunsi photo sabse zyada galtiyan de rahi hai.
+async function reportWrongCounts(wrongCountByPhoto) {
+  for (const photoId in wrongCountByPhoto) {
+    try {
+      const getRes = await fetch(`${FIREBASE_URL}/photos/${photoId}/wrong_count.json`);
+      const current = (await getRes.json()) || 0;
+      const updated = current + wrongCountByPhoto[photoId];
+      await fetch(`${FIREBASE_URL}/photos/${photoId}/wrong_count.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updated)
+      });
+    } catch (err) {
+      console.error("wrong_count update fail:", photoId, err);
+    }
+  }
 }
 
 // Page load hote hi questions laao
